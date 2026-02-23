@@ -1,4 +1,5 @@
 pub mod bridge;
+pub mod clob;
 pub mod comments;
 pub mod data;
 pub mod events;

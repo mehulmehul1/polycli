@@ -24,6 +24,10 @@ struct Cli {
     /// Private key for wallet authentication (overrides env var and config file)
     #[arg(long, global = true)]
     private_key: Option<String>,
+
+    /// Signature type: eoa, proxy, or gnosis-safe (default: proxy)
+    #[arg(long, global = true)]
+    signature_type: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -42,6 +46,8 @@ enum Commands {
     Profiles(commands::profiles::ProfilesArgs),
     /// Sports metadata and teams
     Sports(commands::sports::SportsArgs),
+    /// Interact with the CLOB (order book, trading, balances)
+    Clob(commands::clob::ClobArgs),
     /// Query on-chain data (positions, trades, leaderboards)
     Data(commands::data::DataArgs),
     /// Bridge assets from other chains to Polymarket
@@ -85,6 +91,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Comments(args) => commands::comments::execute(&gamma_client, args, cli.output).await,
         Commands::Profiles(args) => commands::profiles::execute(&gamma_client, args, cli.output).await,
         Commands::Sports(args) => commands::sports::execute(&gamma_client, args, cli.output).await,
+        Commands::Clob(args) => {
+            commands::clob::execute(
+                args,
+                cli.output,
+                cli.private_key.as_deref(),
+                cli.signature_type.as_deref(),
+            )
+            .await
+        }
         Commands::Data(args) => commands::data::execute(&data_client, args, cli.output).await,
         Commands::Bridge(args) => commands::bridge::execute(&bridge_client, args, cli.output).await,
         Commands::Wallet(args) => commands::wallet::execute(args, cli.output, cli.private_key.as_deref()),

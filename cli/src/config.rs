@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 const ENV_VAR: &str = "POLYMARKET_PRIVATE_KEY";
+const SIG_TYPE_ENV_VAR: &str = "POLYMARKET_SIGNATURE_TYPE";
 
 pub const NO_WALLET_MSG: &str =
     "No wallet configured. Run `polymarket wallet create` or `polymarket wallet import <key>`";
@@ -13,6 +14,12 @@ pub const NO_WALLET_MSG: &str =
 pub struct Config {
     pub private_key: String,
     pub chain_id: u64,
+    #[serde(default = "default_signature_type")]
+    pub signature_type: String,
+}
+
+fn default_signature_type() -> String {
+    "proxy".to_string()
 }
 
 pub enum KeySource {
@@ -56,7 +63,31 @@ pub fn load_private_key() -> Option<String> {
     load_config().map(|c| c.private_key)
 }
 
-pub fn save_private_key(key: &str, chain_id: u64) -> Result<()> {
+pub fn load_signature_type() -> Option<String> {
+    load_config().map(|c| c.signature_type)
+}
+
+/// Priority: CLI flag > env var > config file > default ("proxy").
+pub fn resolve_signature_type(cli_flag: Option<&str>) -> String {
+    if let Some(st) = cli_flag {
+        return st.to_string();
+    }
+    if let Ok(st) = std::env::var(SIG_TYPE_ENV_VAR)
+        && !st.is_empty()
+    {
+        return st;
+    }
+    if let Some(st) = load_signature_type() {
+        return st;
+    }
+    "proxy".to_string()
+}
+
+pub fn save_wallet(key: &str, chain_id: u64, signature_type: &str) -> Result<()> {
+    save_config(key, chain_id, signature_type)
+}
+
+fn save_config(key: &str, chain_id: u64, signature_type: &str) -> Result<()> {
     let dir = config_dir()?;
     fs::create_dir_all(&dir).context("Failed to create config directory")?;
 
@@ -69,6 +100,7 @@ pub fn save_private_key(key: &str, chain_id: u64) -> Result<()> {
     let config = Config {
         private_key: key.to_string(),
         chain_id,
+        signature_type: signature_type.to_string(),
     };
     let json = serde_json::to_string_pretty(&config)?;
     let path = config_path()?;
@@ -101,10 +133,10 @@ pub fn resolve_key(cli_flag: Option<&str>) -> (Option<String>, KeySource) {
     if let Some(key) = cli_flag {
         return (Some(key.to_string()), KeySource::Flag);
     }
-    if let Ok(key) = std::env::var(ENV_VAR) {
-        if !key.is_empty() {
-            return (Some(key), KeySource::EnvVar);
-        }
+    if let Ok(key) = std::env::var(ENV_VAR)
+        && !key.is_empty()
+    {
+        return (Some(key), KeySource::EnvVar);
     }
     if let Some(key) = load_private_key() {
         return (Some(key), KeySource::ConfigFile);

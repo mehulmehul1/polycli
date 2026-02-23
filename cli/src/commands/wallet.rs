@@ -2,9 +2,9 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
-use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::LocalSigner;
 use polymarket_client_sdk::auth::Signer as _;
+use polymarket_client_sdk::{POLYGON, derive_proxy_wallet};
 
 use crate::config;
 use crate::output::OutputFormat;
@@ -21,12 +21,18 @@ pub enum WalletCommand {
     Create {
         #[arg(long)]
         force: bool,
+        /// Signature type: eoa, proxy (default), or gnosis-safe
+        #[arg(long, default_value = "proxy")]
+        signature_type: String,
     },
     /// Import an existing private key
     Import {
         key: String,
         #[arg(long)]
         force: bool,
+        /// Signature type: eoa, proxy (default), or gnosis-safe
+        #[arg(long, default_value = "proxy")]
+        signature_type: String,
     },
     /// Show the address of the configured wallet
     Address,
@@ -36,8 +42,15 @@ pub enum WalletCommand {
 
 pub fn execute(args: WalletArgs, output: OutputFormat, private_key_flag: Option<&str>) -> Result<()> {
     match args.command {
-        WalletCommand::Create { force } => cmd_create(output, force),
-        WalletCommand::Import { key, force } => cmd_import(&key, output, force),
+        WalletCommand::Create {
+            force,
+            signature_type,
+        } => cmd_create(output, force, &signature_type),
+        WalletCommand::Import {
+            key,
+            force,
+            signature_type,
+        } => cmd_import(&key, output, force, &signature_type),
         WalletCommand::Address => cmd_address(output, private_key_flag),
         WalletCommand::Show => cmd_show(output, private_key_flag),
     }
@@ -61,7 +74,7 @@ fn normalize_key(key: &str) -> String {
     }
 }
 
-fn cmd_create(output: OutputFormat, force: bool) -> Result<()> {
+fn cmd_create(output: OutputFormat, force: bool, signature_type: &str) -> Result<()> {
     guard_overwrite(force)?;
 
     let signer = LocalSigner::random().with_chain_id(Some(POLYGON));
@@ -69,8 +82,9 @@ fn cmd_create(output: OutputFormat, force: bool) -> Result<()> {
     let bytes = signer.credential().to_bytes();
     let key_hex = format!("0x{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
 
-    config::save_private_key(&key_hex, POLYGON)?;
+    config::save_wallet(&key_hex, POLYGON, signature_type)?;
     let config_path = config::config_path()?;
+    let proxy_addr = derive_proxy_wallet(address, POLYGON);
 
     match output {
         OutputFormat::Json => {
@@ -78,14 +92,20 @@ fn cmd_create(output: OutputFormat, force: bool) -> Result<()> {
                 "{}",
                 serde_json::json!({
                     "address": address.to_string(),
+                    "proxy_address": proxy_addr.map(|a| a.to_string()),
+                    "signature_type": signature_type,
                     "config_path": config_path.display().to_string(),
                 })
             );
         }
         OutputFormat::Table => {
             println!("Wallet created successfully!");
-            println!("Address: {address}");
-            println!("Config:  {}", config_path.display());
+            println!("Address:        {address}");
+            if let Some(proxy) = proxy_addr {
+                println!("Proxy wallet:   {proxy}");
+            }
+            println!("Signature type: {signature_type}");
+            println!("Config:         {}", config_path.display());
             println!();
             println!("IMPORTANT: Back up your private key from the config file.");
             println!("           If lost, your funds cannot be recovered.");
@@ -94,7 +114,7 @@ fn cmd_create(output: OutputFormat, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_import(key: &str, output: OutputFormat, force: bool) -> Result<()> {
+fn cmd_import(key: &str, output: OutputFormat, force: bool, signature_type: &str) -> Result<()> {
     guard_overwrite(force)?;
 
     let normalized = normalize_key(key);
@@ -103,8 +123,9 @@ fn cmd_import(key: &str, output: OutputFormat, force: bool) -> Result<()> {
         .with_chain_id(Some(POLYGON));
     let address = signer.address();
 
-    config::save_private_key(&normalized, POLYGON)?;
+    config::save_wallet(&normalized, POLYGON, signature_type)?;
     let config_path = config::config_path()?;
+    let proxy_addr = derive_proxy_wallet(address, POLYGON);
 
     match output {
         OutputFormat::Json => {
@@ -112,14 +133,20 @@ fn cmd_import(key: &str, output: OutputFormat, force: bool) -> Result<()> {
                 "{}",
                 serde_json::json!({
                     "address": address.to_string(),
+                    "proxy_address": proxy_addr.map(|a| a.to_string()),
+                    "signature_type": signature_type,
                     "config_path": config_path.display().to_string(),
                 })
             );
         }
         OutputFormat::Table => {
             println!("Wallet imported successfully!");
-            println!("Address: {address}");
-            println!("Config:  {}", config_path.display());
+            println!("Address:        {address}");
+            if let Some(proxy) = proxy_addr {
+                println!("Proxy wallet:   {proxy}");
+            }
+            println!("Signature type: {signature_type}");
+            println!("Config:         {}", config_path.display());
         }
     }
     Ok(())
@@ -145,11 +172,16 @@ fn cmd_address(output: OutputFormat, private_key_flag: Option<&str>) -> Result<(
 
 fn cmd_show(output: OutputFormat, private_key_flag: Option<&str>) -> Result<()> {
     let (key, source) = config::resolve_key(private_key_flag);
-    let address = key
+    let signer = key
         .as_deref()
-        .and_then(|k| LocalSigner::from_str(k).ok())
-        .map(|s| s.address().to_string());
+        .and_then(|k| LocalSigner::from_str(k).ok());
+    let address = signer.as_ref().map(|s| s.address().to_string());
+    let proxy_addr = signer
+        .as_ref()
+        .and_then(|s| derive_proxy_wallet(s.address(), POLYGON))
+        .map(|a| a.to_string());
 
+    let sig_type = config::resolve_signature_type(None);
     let config_path = config::config_path()?;
 
     match output {
@@ -158,6 +190,8 @@ fn cmd_show(output: OutputFormat, private_key_flag: Option<&str>) -> Result<()> 
                 "{}",
                 serde_json::json!({
                     "address": address,
+                    "proxy_address": proxy_addr,
+                    "signature_type": sig_type,
                     "config_path": config_path.display().to_string(),
                     "source": source.label(),
                     "configured": address.is_some(),
@@ -166,11 +200,15 @@ fn cmd_show(output: OutputFormat, private_key_flag: Option<&str>) -> Result<()> 
         }
         OutputFormat::Table => {
             match &address {
-                Some(addr) => println!("Address:     {addr}"),
-                None => println!("Address:     (not configured)"),
+                Some(addr) => println!("Address:        {addr}"),
+                None => println!("Address:        (not configured)"),
             }
-            println!("Config path: {}", config_path.display());
-            println!("Key source:  {}", source.label());
+            if let Some(proxy) = &proxy_addr {
+                println!("Proxy wallet:   {proxy}");
+            }
+            println!("Signature type: {sig_type}");
+            println!("Config path:    {}", config_path.display());
+            println!("Key source:     {}", source.label());
         }
     }
     Ok(())
