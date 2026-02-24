@@ -168,3 +168,79 @@ pub fn print_event_detail(e: &Event) {
 
     print_detail_table(rows);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_event(val: serde_json::Value) -> Event {
+        serde_json::from_value(val).unwrap()
+    }
+
+    // ── event_status ────────────────────────────────────────────
+
+    #[test]
+    fn status_closed_overrides_active() {
+        let e = make_event(json!({"id": "1", "closed": true, "active": true}));
+        assert_eq!(event_status(&e), "Closed");
+    }
+
+    #[test]
+    fn status_active_when_not_closed() {
+        let e = make_event(json!({"id": "1", "closed": false, "active": true}));
+        assert_eq!(event_status(&e), "Active");
+    }
+
+    #[test]
+    fn status_inactive_when_fields_missing() {
+        let e = make_event(json!({"id": "1"}));
+        assert_eq!(event_status(&e), "Inactive");
+    }
+
+    #[test]
+    fn status_inactive_when_both_false() {
+        let e = make_event(json!({"id": "1", "closed": false, "active": false}));
+        assert_eq!(event_status(&e), "Inactive");
+    }
+
+    // ── event_to_row ────────────────────────────────────────────
+
+    #[test]
+    fn row_missing_optionals_shows_dashes() {
+        let row = event_to_row(&make_event(json!({"id": "1"})));
+        assert_eq!(row.title, "—");
+        assert_eq!(row.market_count, "—");
+        assert_eq!(row.volume, "—");
+        assert_eq!(row.liquidity, "—");
+        assert_eq!(row.status, "Inactive");
+    }
+
+    #[test]
+    fn row_counts_markets() {
+        let e = make_event(json!({
+            "id": "1",
+            "markets": [{"id": "m1"}, {"id": "m2"}]
+        }));
+        assert_eq!(event_to_row(&e).market_count, "2");
+    }
+
+    #[test]
+    fn row_empty_markets_shows_zero() {
+        let e = make_event(json!({"id": "1", "markets": []}));
+        assert_eq!(event_to_row(&e).market_count, "0");
+    }
+
+    #[test]
+    fn row_truncates_long_title() {
+        let long_title = "b".repeat(100);
+        let e = make_event(json!({"id": "1", "title": long_title}));
+        assert_eq!(event_to_row(&e).title.chars().count(), 60);
+    }
+
+    #[test]
+    fn row_formats_volume() {
+        let e = make_event(json!({"id": "1", "volume": "2500000"}));
+        assert_eq!(event_to_row(&e).volume, "$2.5M");
+    }
+}

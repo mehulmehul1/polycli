@@ -62,3 +62,94 @@ macro_rules! detail_field {
 }
 
 pub(crate) use detail_field;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    // ── truncate ────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_shorter_than_max_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_length_unchanged() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_over_max_appends_ellipsis() {
+        assert_eq!(truncate("hello world", 6), "hello\u{2026}");
+    }
+
+    #[test]
+    fn truncate_max_one_is_just_ellipsis() {
+        assert_eq!(truncate("hello", 1), "\u{2026}");
+    }
+
+    #[test]
+    fn truncate_max_zero_is_just_ellipsis() {
+        assert_eq!(truncate("hello", 0), "\u{2026}");
+    }
+
+    #[test]
+    fn truncate_empty_string_unchanged() {
+        assert_eq!(truncate("", 5), "");
+    }
+
+    #[test]
+    fn truncate_counts_chars_not_bytes() {
+        // "café!" is 5 chars but 6 bytes (é is 2 bytes)
+        assert_eq!(truncate("café!", 3), "ca\u{2026}");
+    }
+
+    // ── format_decimal ──────────────────────────────────────────
+
+    #[test]
+    fn format_decimal_millions() {
+        assert_eq!(format_decimal(dec!(1_500_000)), "$1.5M");
+    }
+
+    #[test]
+    fn format_decimal_at_million_boundary() {
+        assert_eq!(format_decimal(dec!(1_000_000)), "$1.0M");
+    }
+
+    #[test]
+    fn format_decimal_thousands() {
+        assert_eq!(format_decimal(dec!(1_500)), "$1.5K");
+    }
+
+    #[test]
+    fn format_decimal_at_thousand_boundary() {
+        assert_eq!(format_decimal(dec!(1_000)), "$1.0K");
+    }
+
+    #[test]
+    fn format_decimal_just_below_thousand() {
+        assert_eq!(format_decimal(dec!(999)), "$999.00");
+    }
+
+    #[test]
+    fn format_decimal_sub_dollar() {
+        assert_eq!(format_decimal(dec!(0.5)), "$0.50");
+    }
+
+    #[test]
+    fn format_decimal_zero() {
+        assert_eq!(format_decimal(dec!(0)), "$0.00");
+    }
+
+    #[test]
+    fn format_decimal_negative() {
+        assert_eq!(format_decimal(dec!(-500)), "$-500.00");
+    }
+
+    #[test]
+    fn format_decimal_just_below_million_uses_k() {
+        assert_eq!(format_decimal(dec!(999_999)), "$1000.0K");
+    }
+}

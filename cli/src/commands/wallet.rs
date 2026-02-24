@@ -223,3 +223,28 @@ fn cmd_show(output: &OutputFormat, private_key_flag: Option<&str>) -> Result<()>
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_key_adds_prefix() {
+        assert_eq!(
+            normalize_key("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"),
+            "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        );
+    }
+
+    #[test]
+    fn normalize_key_with_prefix_unchanged() {
+        let key = "0xabcdef";
+        assert_eq!(normalize_key(key), key);
+    }
+
+    #[test]
+    fn normalize_key_uppercase_prefix() {
+        let key = "0Xabcdef";
+        assert_eq!(normalize_key(key), key);
+    }
+}

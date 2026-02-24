@@ -160,3 +160,82 @@ pub fn print_market_detail(m: &Market) {
 
     print_detail_table(rows);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_market(val: serde_json::Value) -> Market {
+        serde_json::from_value(val).unwrap()
+    }
+
+    // ── market_status ───────────────────────────────────────────
+
+    #[test]
+    fn status_closed_overrides_active() {
+        let m = make_market(json!({"id": "1", "closed": true, "active": true}));
+        assert_eq!(market_status(&m), "Closed");
+    }
+
+    #[test]
+    fn status_active_when_not_closed() {
+        let m = make_market(json!({"id": "1", "closed": false, "active": true}));
+        assert_eq!(market_status(&m), "Active");
+    }
+
+    #[test]
+    fn status_inactive_when_fields_missing() {
+        let m = make_market(json!({"id": "1"}));
+        assert_eq!(market_status(&m), "Inactive");
+    }
+
+    #[test]
+    fn status_inactive_when_both_false() {
+        let m = make_market(json!({"id": "1", "closed": false, "active": false}));
+        assert_eq!(market_status(&m), "Inactive");
+    }
+
+    // ── market_to_row ───────────────────────────────────────────
+
+    #[test]
+    fn row_missing_optionals_shows_dashes() {
+        let row = market_to_row(&make_market(json!({"id": "1"})));
+        assert_eq!(row.question, "—");
+        assert_eq!(row.price_yes, "—");
+        assert_eq!(row.volume, "—");
+        assert_eq!(row.liquidity, "—");
+        assert_eq!(row.status, "Inactive");
+    }
+
+    #[test]
+    fn row_formats_price_as_cents() {
+        let m = make_market(json!({
+            "id": "1",
+            "outcomePrices": "[\"0.65\",\"0.35\"]"
+        }));
+        assert_eq!(market_to_row(&m).price_yes, "65.00¢");
+    }
+
+    #[test]
+    fn row_truncates_long_question() {
+        let long_q = "a".repeat(100);
+        let m = make_market(json!({"id": "1", "question": long_q}));
+        let row = market_to_row(&m);
+        assert_eq!(row.question.chars().count(), 60);
+    }
+
+    #[test]
+    fn row_formats_volume_and_liquidity() {
+        let m = make_market(json!({"id": "1", "volumeNum": "1500000", "liquidityNum": "2500"}));
+        let row = market_to_row(&m);
+        assert_eq!(row.volume, "$1.5M");
+        assert_eq!(row.liquidity, "$2.5K");
+    }
+
+    #[test]
+    fn row_propagates_status() {
+        let m = make_market(json!({"id": "1", "active": true}));
+        assert_eq!(market_to_row(&m).status, "Active");
+    }
+}

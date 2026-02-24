@@ -40,3 +40,31 @@ pub async fn authenticated_clob_client(
         .await
         .context("Failed to authenticate with Polymarket CLOB")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_signature_type_proxy() {
+        assert_eq!(parse_signature_type("proxy"), SignatureType::Proxy);
+    }
+
+    #[test]
+    fn parse_signature_type_gnosis_safe() {
+        assert_eq!(
+            parse_signature_type("gnosis-safe"),
+            SignatureType::GnosisSafe
+        );
+    }
+
+    #[test]
+    fn parse_signature_type_eoa() {
+        assert_eq!(parse_signature_type("eoa"), SignatureType::Eoa);
+    }
+
+    #[test]
+    fn parse_signature_type_unknown_defaults_to_eoa() {
+        assert_eq!(parse_signature_type("unknown"), SignatureType::Eoa);
+    }
+}

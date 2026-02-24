@@ -132,3 +132,84 @@ pub fn resolve_key(cli_flag: Option<&str>) -> (Option<String>, KeySource) {
     }
     (None, KeySource::None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Mutex to serialize env var tests (set_var is not thread-safe)
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    unsafe fn set(var: &str, val: &str) {
+        unsafe { std::env::set_var(var, val) };
+    }
+
+    unsafe fn unset(var: &str) {
+        unsafe { std::env::remove_var(var) };
+    }
+
+    // ── resolve_key ─────────────────────────────────────────────
+    //
+    // We can only reliably test: (1) flag always wins, (2) env var
+    // beats no-flag. We cannot isolate from the config file in unit
+    // tests, so we test what we can and skip what we can't.
+
+    #[test]
+    fn resolve_key_flag_overrides_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe { set(ENV_VAR, "env_key") };
+        let (key, source) = resolve_key(Some("flag_key"));
+        assert_eq!(key.unwrap(), "flag_key");
+        assert!(matches!(source, KeySource::Flag));
+        unsafe { unset(ENV_VAR) };
+    }
+
+    #[test]
+    fn resolve_key_env_var_returns_env_value() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe { set(ENV_VAR, "env_key_value") };
+        let (key, source) = resolve_key(None);
+        // Env var should win over config file
+        assert_eq!(key.unwrap(), "env_key_value");
+        assert!(matches!(source, KeySource::EnvVar));
+        unsafe { unset(ENV_VAR) };
+    }
+
+    #[test]
+    fn resolve_key_skips_empty_env_var() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe { set(ENV_VAR, "") };
+        let (_, source) = resolve_key(None);
+        // Should NOT be EnvVar — empty string is skipped
+        assert!(!matches!(source, KeySource::EnvVar));
+        unsafe { unset(ENV_VAR) };
+    }
+
+    // ── resolve_signature_type ──────────────────────────────────
+
+    #[test]
+    fn resolve_sig_type_flag_overrides_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe { set(SIG_TYPE_ENV_VAR, "eoa") };
+        assert_eq!(resolve_signature_type(Some("gnosis-safe")), "gnosis-safe");
+        unsafe { unset(SIG_TYPE_ENV_VAR) };
+    }
+
+    #[test]
+    fn resolve_sig_type_env_var_returns_env_value() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe { set(SIG_TYPE_ENV_VAR, "eoa") };
+        assert_eq!(resolve_signature_type(None), "eoa");
+        unsafe { unset(SIG_TYPE_ENV_VAR) };
+    }
+
+    #[test]
+    fn resolve_sig_type_without_env_returns_nonempty() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe { unset(SIG_TYPE_ENV_VAR) };
+        let result = resolve_signature_type(None);
+        // Will be "proxy" (default) or from config file — either way, not empty
+        assert!(!result.is_empty());
+    }
+}
