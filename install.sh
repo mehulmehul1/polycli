@@ -37,14 +37,43 @@ main() {
     exit 1
   fi
 
-  url="https://github.com/${REPO}/releases/download/${tag}/${BINARY}-${tag}-${target}.tar.gz"
+  tarball_name="${BINARY}-${tag}-${target}.tar.gz"
+  url="https://github.com/${REPO}/releases/download/${tag}/${tarball_name}"
+  checksums_url="https://github.com/${REPO}/releases/download/${tag}/checksums.txt"
 
   echo "Installing ${BINARY} ${tag} (${target})..."
 
   tmpdir=$(mktemp -d)
   trap 'rm -rf "$tmpdir"' EXIT
 
-  curl -sSfL "$url" | tar xz -C "$tmpdir"
+  curl -sSfL "$url" -o "$tmpdir/$tarball_name"
+  curl -sSfL "$checksums_url" -o "$tmpdir/checksums.txt"
+
+  expected_hash=$(grep "$tarball_name" "$tmpdir/checksums.txt" | awk '{print $1}')
+  if [ -z "$expected_hash" ]; then
+    echo "Error: no checksum found for $tarball_name" >&2
+    exit 1
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_hash=$(sha256sum "$tmpdir/$tarball_name" | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    actual_hash=$(shasum -a 256 "$tmpdir/$tarball_name" | awk '{print $1}')
+  else
+    echo "Error: need sha256sum or shasum to verify download" >&2
+    exit 1
+  fi
+
+  if [ "$actual_hash" != "$expected_hash" ]; then
+    echo "Error: checksum mismatch!" >&2
+    echo "  Expected: $expected_hash" >&2
+    echo "  Got:      $actual_hash" >&2
+    echo "The downloaded file may have been tampered with. Aborting." >&2
+    exit 1
+  fi
+
+  echo "Checksum verified."
+  tar xzf "$tmpdir/$tarball_name" -C "$tmpdir"
 
   if [ -w "$INSTALL_DIR" ]; then
     mv "$tmpdir/$BINARY" "$INSTALL_DIR/$BINARY"

@@ -32,6 +32,12 @@ pub fn execute() -> anyhow::Result<()> {
     let tmpdir = tempdir()?;
     let tarball = format!("{tmpdir}/{BINARY}.tar.gz");
 
+    let tarball_name =
+        format!("{BINARY}-{latest_tag}-{target}.tar.gz");
+    let checksums_url = format!(
+        "https://github.com/{REPO}/releases/download/{latest_tag}/checksums.txt"
+    );
+
     println!("Downloading {latest_tag} ({target})...");
 
     let status = Command::new("curl")
@@ -41,6 +47,17 @@ pub fn execute() -> anyhow::Result<()> {
     if !status.success() {
         bail!("Download failed (HTTP error)");
     }
+
+    let checksums_file = format!("{tmpdir}/checksums.txt");
+    let status = Command::new("curl")
+        .args(["-sSfL", "-o", &checksums_file, &checksums_url])
+        .status()
+        .context("Failed to download checksums")?;
+    if !status.success() {
+        bail!("Failed to download checksums.txt — cannot verify integrity");
+    }
+
+    verify_checksum(&tarball, &checksums_file, &tarball_name)?;
 
     let status = Command::new("tar")
         .args(["xzf", &tarball, "-C", &tmpdir])
@@ -127,6 +144,49 @@ fn tempdir() -> anyhow::Result<String> {
         bail!("mktemp failed");
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn verify_checksum(file_path: &str, checksums_file: &str, expected_name: &str) -> anyhow::Result<()> {
+    let checksums = fs::read_to_string(checksums_file).context("Failed to read checksums.txt")?;
+
+    let expected_hash = checksums
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let hash = parts.next()?;
+            let name = parts.next()?;
+            if name == expected_name || name.trim_start_matches("./") == expected_name {
+                Some(hash.to_string())
+            } else {
+                None
+            }
+        })
+        .context(format!("No checksum found for {expected_name} in checksums.txt"))?;
+
+    let output = Command::new("shasum")
+        .args(["-a", "256", file_path])
+        .output()
+        .or_else(|_| Command::new("sha256sum").arg(file_path).output())
+        .context("Failed to compute SHA256 (need shasum or sha256sum)")?;
+
+    if !output.status.success() {
+        bail!("Failed to compute SHA256 of downloaded file");
+    }
+
+    let actual_hash = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
+
+    if actual_hash != expected_hash {
+        bail!(
+            "Checksum mismatch!\n  Expected: {expected_hash}\n  Got:      {actual_hash}\n\nThe downloaded binary may have been tampered with. Aborting."
+        );
+    }
+
+    println!("Checksum verified.");
+    Ok(())
 }
 
 fn sudo_mv(from: &str, to: &str) -> std::io::Result<()> {
