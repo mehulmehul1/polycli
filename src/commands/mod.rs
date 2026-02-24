@@ -13,6 +13,7 @@ pub mod series;
 pub mod setup;
 pub mod sports;
 pub mod tags;
+pub mod upgrade;
 pub mod wallet;
 
 pub fn is_numeric_id(id: &str) -> bool {

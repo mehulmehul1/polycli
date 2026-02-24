@@ -414,6 +414,7 @@ Supports command history. All commands work the same as the CLI, just without th
 ```bash
 polymarket status     # API health check
 polymarket setup      # Guided first-time setup wizard
+polymarket upgrade    # Update to the latest version
 polymarket --version
 polymarket --help
 ```

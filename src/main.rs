@@ -62,6 +62,8 @@ enum Commands {
     Wallet(commands::wallet::WalletArgs),
     /// Check API health status
     Status,
+    /// Update to the latest version
+    Upgrade,
 }
 
 #[tokio::main]
@@ -182,6 +184,7 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Wallet(args) => {
             commands::wallet::execute(args, &cli.output, cli.private_key.as_deref())
         }
+        Commands::Upgrade => commands::upgrade::execute(),
         Commands::Status => {
             let status = polymarket_client_sdk::gamma::Client::default()
                 .status()
