@@ -27,6 +27,7 @@ fn help_lists_all_top_level_commands() {
             .and(predicate::str::contains("ctf"))
             .and(predicate::str::contains("data"))
             .and(predicate::str::contains("bridge"))
+            .and(predicate::str::contains("bot"))
             .and(predicate::str::contains("wallet"))
             .and(predicate::str::contains("status")),
     );
@@ -485,4 +486,13 @@ fn wallet_address_succeeds_or_fails_gracefully() {
     let output = polymarket().args(["wallet", "address"]).output().unwrap();
     // Either succeeds or fails with an error message — not a panic
     assert!(output.status.success() || !output.stderr.is_empty());
+}
+
+#[test]
+fn bot_help_lists_subcommands() {
+    polymarket()
+        .args(["bot", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("watch-btc"));
 }

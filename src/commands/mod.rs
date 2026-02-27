@@ -1,6 +1,7 @@
 use polymarket_client_sdk::types::{Address, B256};
 
 pub mod approve;
+pub mod bot;
 pub mod bridge;
 pub mod clob;
 pub mod comments;

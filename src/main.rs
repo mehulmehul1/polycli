@@ -58,6 +58,8 @@ enum Commands {
     Data(commands::data::DataArgs),
     /// Bridge assets from other chains to Polymarket
     Bridge(commands::bridge::BridgeArgs),
+    /// Bot utilities and market watchers
+    Bot(commands::bot::BotArgs),
     /// Manage wallet and authentication
     Wallet(commands::wallet::WalletArgs),
     /// Check API health status
@@ -181,6 +183,7 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
             )
             .await
         }
+        Commands::Bot(args) => commands::bot::execute(args).await,
         Commands::Wallet(args) => {
             commands::wallet::execute(args, &cli.output, cli.private_key.as_deref())
         }
