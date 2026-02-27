@@ -1,5 +1,6 @@
 use crate::bot::candles::CandleEngine;
-use crate::bot::indicators::IndicatorEngine;
+use crate::bot::indicators::{IndicatorEngine, IndicatorState};
+use crate::bot::signal::{SignalEngine, Bias, EntrySignal, ExitSignal};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Timelike, Utc};
 use clap::{Args, Subcommand};
@@ -44,6 +45,52 @@ struct MarketSnapshot {
     top5_ask_depth: Decimal,
 }
 
+/// Shadow position tracker for simulation mode (NO real orders)
+struct ShadowPosition {
+    side: Option<Bias>,
+    entry_price: f64,
+    size: f64,
+    realized_pnl: f64,
+    scale_stage: u8,
+}
+
+impl Default for ShadowPosition {
+    fn default() -> Self {
+        Self {
+            side: None,
+            entry_price: 0.0,
+            size: 0.0,
+            realized_pnl: 0.0,
+            scale_stage: 0,
+        }
+    }
+}
+
+impl ShadowPosition {
+    fn is_active(&self) -> bool {
+        self.side.is_some()
+    }
+
+    fn reset(&mut self) {
+        self.side = None;
+        self.entry_price = 0.0;
+        self.size = 0.0;
+        self.scale_stage = 0;
+    }
+
+    fn pnl(&self, current_price: f64) -> f64 {
+        if !self.is_active() {
+            return 0.0;
+        }
+        match self.side {
+            Some(Bias::Long) => current_price - self.entry_price,
+            Some(Bias::Short) => self.entry_price - current_price,
+            Some(Bias::Neutral) => 0.0,
+            None => 0.0,
+        }
+    }
+}
+
 pub async fn execute(args: BotArgs) -> Result<()> {
     match args.command {
         BotCommand::WatchBtc => watch_btc_market().await,
@@ -55,27 +102,71 @@ async fn watch_btc_market() -> Result<()> {
     let clob_client = clob::Client::default();
 
     let mut watched = discover_market_loop(&gamma_client).await;
+
+    // ========== MULTI-TIMEFRAME INDICATOR ENGINES ==========
+    let mut ind_1m = IndicatorEngine::new();
+    let mut ind_15s = IndicatorEngine::new();
+    let mut ind_5s = IndicatorEngine::new();
+    let mut signal_engine = SignalEngine::new();
+
     let mut candle_engine = CandleEngine::new();
-    let mut indicator_engine = IndicatorEngine::new();
-    candle_engine.set_debug(true);
-    indicator_engine.set_debug(true);
-    let mut ticks_since_last_log: u64 = 0;
+    candle_engine.set_debug(false);  // Reduce noise in shadow mode
+
+    // ========== SHADOW POSITION TRACKER ==========
+    let mut shadow = ShadowPosition::default();
+
+    // ========== STATE STORAGE FOR SIGNAL ENGINE ==========
+    let mut state_1m = IndicatorState::default();
+    let mut state_15s = IndicatorState::default();
+    let mut state_5s = IndicatorState::default();
+
+    // ========== MARKET RESET TRACKING ==========
+    let mut current_slug = watched.slug.clone();
+
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    println!("[SHADOW MODE] Initialized - NO real orders will be placed");
+    println!("[SHADOW MODE] Multi-timeframe: 1m (bias), 15s (accel), 5s (entry)");
+    println!("========================================");
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
+                println!("\n[SHADOW] Final PnL: {:.4}%", shadow.realized_pnl * 100.0);
                 println!("Received Ctrl+C, stopping bot watch.");
                 break;
             }
             _ = ticker.tick() => {
-                if Utc::now() >= watched.end_time {
+                // ========== MARKET ROLL DETECTION & RESET ==========
+                if Utc::now() >= watched.end_time || watched.slug != current_slug {
+                    // Print final shadow state before reset
+                    if shadow.is_active() {
+                        println!(
+                            "[SHADOW] Contract rollover - Forced close | PnL: {:.4}%",
+                            shadow.realized_pnl * 100.0
+                        );
+                    }
+
                     println!(
                         "Market {} reached resolution time. Looking for next active BTC 5m market...",
                         watched.slug
                     );
                     watched = discover_market_loop(&gamma_client).await;
+                    current_slug = watched.slug.clone();
+
+                    // ========== CRITICAL: RESET ALL STATE ON MARKET ROLL ==========
+                    signal_engine = SignalEngine::new();
+                    ind_1m.reset();
+                    ind_15s.reset();
+                    ind_5s.reset();
+                    shadow.reset();
+                    state_1m = IndicatorState::default();
+                    state_15s = IndicatorState::default();
+                    state_5s = IndicatorState::default();
+
+                    println!("[MARKET RESET] All engines and shadow position cleared | {}", watched.slug);
+                    println!("========================================");
                 }
 
                 let snapshot = match fetch_snapshot(&clob_client, watched.yes_token_id).await {
@@ -91,40 +182,141 @@ async fn watch_btc_market() -> Result<()> {
                     let spread_f64 = snapshot.spread.map(decimal_to_f64).unwrap_or(0.0);
                     let epoch_seconds = Utc::now().timestamp() as u64;
 
+                    // ========== UPDATE INDICATORS ON CANDLE CLOSE ==========
                     let closed_candles = candle_engine.update(midpoint, spread_f64, simulated_volume, epoch_seconds);
 
                     if let Some(closed) = closed_candles {
-                        if let Some(one_minute) = closed.one_minute {
-                            let state = indicator_engine.update(&one_minute);
-                            if indicator_engine.debug_logs {
-                                println!(
-                                    "[candles] 1m_close: O={:.4} H={:.4} L={:.4} C={:.4} V={:.4}",
-                                    one_minute.open, one_minute.high, one_minute.low, one_minute.close, one_minute.volume
-                                );
-                                println!(
-                                    "[INDICATORS] EMA9={:?} EMA21={:?} RSI={:?} SLOPE={:?} READY={}",
-                                    state.ema9, state.ema21, state.rsi14, state.momentum_slope, indicator_engine.is_ready()
-                                );
+                        // Update 15s indicators
+                        if let Some(c) = closed.fifteen_second {
+                            state_15s = ind_15s.update(&c);
+                        }
+
+                        // Update 1m indicators
+                        if let Some(c) = closed.one_minute {
+                            state_1m = ind_1m.update(&c);
+                        }
+
+                        // Update 5s indicators and evaluate signals
+                        if let Some(c) = closed.five_second {
+                            state_5s = ind_5s.update(&c);
+
+                            let prev_bias = shadow.side;
+                            
+                            // ========== SIGNAL ENGINE EVALUATION (on 5s close only) ==========
+                            let signal = signal_engine.update(
+                                &state_1m,
+                                &state_15s,
+                                &state_5s,
+                                midpoint
+                            );
+
+                            // ========== BIAS CHANGE LOGGING ==========
+                            if signal.bias != prev_bias.unwrap_or(Bias::Neutral) && signal.bias != Bias::Neutral {
+                                println!("[BIAS CHANGE] {:?} -> {:?}", prev_bias, signal.bias);
                             }
+
+                            // ========== SHADOW EXECUTION LAYER ==========
+                            handle_shadow_signals(&signal, midpoint, &mut shadow, &watched);
                         }
                     }
 
-                    ticks_since_last_log += 1;
-
-                    if ticks_since_last_log >= 60 {
-                        ticks_since_last_log = 0;
-
-                        let last_5s = candle_engine.get_last_5s();
-                        let last_15s = candle_engine.get_last_15s();
+                    // ========== SHADOW PnL TICKER (every 30 seconds) ==========
+                    if shadow.is_active() {
+                        let unrealized = shadow.pnl(midpoint);
+                        let total = shadow.realized_pnl + unrealized;
+                        // Only log periodically, not every tick
+                        if epoch_seconds % 30 == 0 {
+                            println!(
+                                "[SHADOW TICK] {:?} @ {:.4} | Unrealized: {:.4}% | Total: {:.4}%",
+                                shadow.side.unwrap(), midpoint, unrealized * 100.0, total * 100.0
+                            );
+                        }
                     }
                 }
 
-                print_snapshot(&watched, &snapshot);
+                // print_snapshot(&watched, &snapshot);
             }
         }
     }
 
     Ok(())
+}
+
+/// Handle signal events in shadow mode (NO real orders)
+fn handle_shadow_signals(
+    signal: &crate::bot::signal::SignalState,
+    price: f64,
+    shadow: &mut ShadowPosition,
+    market: &WatchedMarket,
+) {
+    // ========== ENTRY HANDLING ==========
+    match signal.entry {
+        EntrySignal::Long => {
+            if !shadow.is_active() {
+                shadow.side = Some(Bias::Long);
+                shadow.entry_price = price;
+                shadow.size = 1.0;
+                shadow.scale_stage = 0;
+                println!(
+                    "[SHADOW ENTRY] {} | LONG @ {:.4} | Time Remaining: {}s",
+                    market.label, price, (market.end_time - Utc::now()).num_seconds().max(0)
+                );
+            }
+        }
+        EntrySignal::Short => {
+            if !shadow.is_active() {
+                shadow.side = Some(Bias::Short);
+                shadow.entry_price = price;
+                shadow.size = 1.0;
+                shadow.scale_stage = 0;
+                println!(
+                    "[SHADOW ENTRY] {} | SHORT @ {:.4} | Time Remaining: {}s",
+                    market.label, price, (market.end_time - Utc::now()).num_seconds().max(0)
+                );
+            }
+        }
+        EntrySignal::None => {}
+    }
+
+    // ========== EXIT HANDLING ==========
+    match signal.exit {
+        ExitSignal::ScaleOut25 => {
+            if shadow.is_active() && shadow.scale_stage == 0 {
+                let pnl = shadow.pnl(price);
+                shadow.realized_pnl += pnl * 0.25;
+                shadow.scale_stage = 1;
+                println!(
+                    "[SHADOW SCALE 25%] {} | @ {:.4} | Trade PnL: {:.4}% | Total: {:.4}%",
+                    market.label, price, pnl * 100.0, shadow.realized_pnl * 100.0
+                );
+            }
+        }
+        ExitSignal::ScaleOut50 => {
+            if shadow.is_active() && shadow.scale_stage < 2 {
+                let remaining = if shadow.scale_stage == 0 { 1.0 } else { 0.75 };
+                let pnl = shadow.pnl(price);
+                shadow.realized_pnl += pnl * remaining * 0.5;
+                shadow.scale_stage = 2;
+                println!(
+                    "[SHADOW SCALE 50%] {} | @ {:.4} | Trade PnL: {:.4}% | Total: {:.4}%",
+                    market.label, price, pnl * 100.0, shadow.realized_pnl * 100.0
+                );
+            }
+        }
+        ExitSignal::FullExit | ExitSignal::StopLoss => {
+            if shadow.is_active() {
+                let pnl = shadow.pnl(price);
+                shadow.realized_pnl += pnl;
+                let exit_type = if signal.exit == ExitSignal::StopLoss { "STOP LOSS" } else { "FULL EXIT" };
+                println!(
+                    "[SHADOW {}] {} | {:?} @ {:.4} | Trade PnL: {:.4}% | Total: {:.4}%",
+                    exit_type, market.label, shadow.side, price, pnl * 100.0, shadow.realized_pnl * 100.0
+                );
+                shadow.reset();
+            }
+        }
+        ExitSignal::None => {}
+    }
 }
 
 async fn discover_market_loop(client: &gamma::Client) -> WatchedMarket {

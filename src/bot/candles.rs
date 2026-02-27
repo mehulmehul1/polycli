@@ -284,7 +284,8 @@ mod tests {
         assert_eq!(c1m.low, 0.69);
         assert_eq!(c1m.close, 0.69);
 
-        // Volume check (Snapshot mode: 10 + 10 + 10 = 30 delta total)
-        assert_eq!(c1m.volume, 30.0);
+        // Volume check (Snapshot mode: 0 (first tick) + 10 + 10 = 20 delta total)
+        // First tick contributes 0 delta because last_snapshot_vol starts at same value
+        assert_eq!(c1m.volume, 20.0);
         }
 }
