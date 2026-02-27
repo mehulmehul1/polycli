@@ -26,6 +26,12 @@ pub struct CandleEngine {
     one_minute: CandleAggregator,
 }
 
+pub struct ClosedCandles {
+    pub five_second: Option<Candle>,
+    pub fifteen_second: Option<Candle>,
+    pub one_minute: Option<Candle>,
+}
+
 impl CandleEngine {
     #[must_use]
     pub fn new() -> Self {
@@ -48,17 +54,21 @@ impl CandleEngine {
         self.one_minute.volume_mode = mode;
     }
 
-    /// Update with a strict epoch aligned timestamp. Returns true if price was accepted.
-    pub fn update(&mut self, price: f64, spread: f64, volume: f64, epoch_seconds: u64) -> bool {
+    /// Update with a strict epoch aligned timestamp. Returns `Some(ClosedCandles)` if price was accepted.
+    pub fn update(&mut self, price: f64, spread: f64, volume: f64, epoch_seconds: u64) -> Option<ClosedCandles> {
         if !is_price_valid(price, spread) {
-            return false;
+            return None;
         }
 
-        self.five_second.update(price, volume, epoch_seconds);
-        self.fifteen_second.update(price, volume, epoch_seconds);
-        self.one_minute.update(price, volume, epoch_seconds);
+        let c5 = self.five_second.update(price, volume, epoch_seconds);
+        let c15 = self.fifteen_second.update(price, volume, epoch_seconds);
+        let c1m = self.one_minute.update(price, volume, epoch_seconds);
 
-        true
+        Some(ClosedCandles {
+            five_second: c5,
+            fifteen_second: c15,
+            one_minute: c1m,
+        })
     }
 
     #[must_use]
@@ -106,7 +116,7 @@ impl CandleAggregator {
         }
     }
 
-    pub fn update(&mut self, price: f64, volume: f64, epoch_seconds: u64) {
+    pub fn update(&mut self, price: f64, volume: f64, epoch_seconds: u64) -> Option<Candle> {
         let bucket_start = (epoch_seconds / self.interval_seconds) * self.interval_seconds;
 
         let delta_vol = match self.volume_mode {
@@ -118,18 +128,20 @@ impl CandleAggregator {
             }
         };
 
+        let mut closed_candle = None;
+
         if let Some(current) = self.current.as_mut() {
             if bucket_start == current.start_time {
                 current.high = current.high.max(price);
                 current.low = current.low.min(price);
                 current.close = price;
                 current.volume += delta_vol;
-                return;
+                return None;
             }
 
             if bucket_start < current.start_time {
                 // Ignore late/out-of-order ticks
-                return;
+                return None;
             }
 
             if bucket_start > current.start_time {
@@ -143,6 +155,7 @@ impl CandleAggregator {
                     );
                 }
                 self.push(closed);
+                closed_candle = Some(closed);
             }
         }
 
@@ -163,6 +176,8 @@ impl CandleAggregator {
             // For snapshot mode, the first tick contributes delta 0 usually, but we record the delta anyway.
             volume: delta_vol,
         });
+
+        closed_candle
     }
 
     fn push(&mut self, candle: Candle) {
@@ -227,10 +242,10 @@ mod tests {
         let mut engine = CandleEngine::new();
         let t0 = 100_000_u64;
 
-        assert!(!engine.update(0.005, 0.0, 1.0, t0)); // <= 0.01
-        assert!(!engine.update(0.995, 0.95, 1.0, t0)); // > 0.99 & spread > 0.9
-        assert!(!engine.update(f64::NAN, 0.1, 1.0, t0)); // NaN
-        assert!(!engine.update(f64::INFINITY, 0.1, 1.0, t0)); // Inf
+        assert!(engine.update(0.005, 0.0, 1.0, t0).is_none()); // <= 0.01
+        assert!(engine.update(0.995, 0.95, 1.0, t0).is_none()); // > 0.99 & spread > 0.9
+        assert!(engine.update(f64::NAN, 0.1, 1.0, t0).is_none()); // NaN
+        assert!(engine.update(f64::INFINITY, 0.1, 1.0, t0).is_none()); // Inf
 
         engine.update(0.50, 0.1, 1.0, t0); // valid
 

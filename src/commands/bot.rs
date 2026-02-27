@@ -1,4 +1,5 @@
 use crate::bot::candles::CandleEngine;
+use crate::bot::indicators::IndicatorEngine;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Timelike, Utc};
 use clap::{Args, Subcommand};
@@ -55,9 +56,10 @@ async fn watch_btc_market() -> Result<()> {
 
     let mut watched = discover_market_loop(&gamma_client).await;
     let mut candle_engine = CandleEngine::new();
+    let mut indicator_engine = IndicatorEngine::new();
     candle_engine.set_debug(true);
+    indicator_engine.set_debug(true);
     let mut ticks_since_last_log: u64 = 0;
-    let mut last_logged_1m_start: Option<u64> = None;
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -89,7 +91,23 @@ async fn watch_btc_market() -> Result<()> {
                     let spread_f64 = snapshot.spread.map(decimal_to_f64).unwrap_or(0.0);
                     let epoch_seconds = Utc::now().timestamp() as u64;
 
-                    candle_engine.update(midpoint, spread_f64, simulated_volume, epoch_seconds);
+                    let closed_candles = candle_engine.update(midpoint, spread_f64, simulated_volume, epoch_seconds);
+
+                    if let Some(closed) = closed_candles {
+                        if let Some(one_minute) = closed.one_minute {
+                            let state = indicator_engine.update(&one_minute);
+                            if indicator_engine.debug_logs {
+                                println!(
+                                    "[candles] 1m_close: O={:.4} H={:.4} L={:.4} C={:.4} V={:.4}",
+                                    one_minute.open, one_minute.high, one_minute.low, one_minute.close, one_minute.volume
+                                );
+                                println!(
+                                    "[INDICATORS] EMA9={:?} EMA21={:?} RSI={:?} SLOPE={:?} READY={}",
+                                    state.ema9, state.ema21, state.rsi14, state.momentum_slope, indicator_engine.is_ready()
+                                );
+                            }
+                        }
+                    }
 
                     ticks_since_last_log += 1;
 
@@ -98,20 +116,6 @@ async fn watch_btc_market() -> Result<()> {
 
                         let last_5s = candle_engine.get_last_5s();
                         let last_15s = candle_engine.get_last_15s();
-                        let last_1m = candle_engine.get_last_1m();
-
-                        if let Some(one_minute) = last_1m.filter(|c| Some(c.start_time) != last_logged_1m_start)
-                        {
-                            last_logged_1m_start = Some(one_minute.start_time);
-                            println!(
-                                "[candles] 5s_close={} 15s_close={} 1m_open={:.4} 1m_close={:.4} 1m_volume={:.4}",
-                                display_candle_close(last_5s),
-                                display_candle_close(last_15s),
-                                one_minute.open,
-                                one_minute.close,
-                                one_minute.volume
-                            );
-                        }
                     }
                 }
 
