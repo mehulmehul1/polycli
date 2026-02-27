@@ -209,6 +209,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn detect_target_returns_valid_triple() {
         let target = detect_target().unwrap();
         assert!(

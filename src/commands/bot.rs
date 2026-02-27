@@ -1,3 +1,4 @@
+use crate::bot::candles::CandleEngine;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Timelike, Utc};
 use clap::{Args, Subcommand};
@@ -9,7 +10,7 @@ use polymarket_client_sdk::gamma::types::request::{
 };
 use polymarket_client_sdk::gamma::types::response::Market;
 use polymarket_client_sdk::types::{Decimal, U256};
-use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
+use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
 
 const BTC_UPDOWN_SLUG_PREFIX: &str = "btc-updown-5m-";
 const FIVE_MINUTES_SECONDS: i64 = 300;
@@ -53,6 +54,10 @@ async fn watch_btc_market() -> Result<()> {
     let clob_client = clob::Client::default();
 
     let mut watched = discover_market_loop(&gamma_client).await;
+    let mut candle_engine = CandleEngine::new();
+    candle_engine.set_debug(true);
+    let mut ticks_since_last_log: u64 = 0;
+    let mut last_logged_1m_start: Option<u64> = None;
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -78,6 +83,37 @@ async fn watch_btc_market() -> Result<()> {
                         continue;
                     }
                 };
+
+                if let Some(midpoint) = midpoint_price(&snapshot) {
+                    let simulated_volume = decimal_to_f64(snapshot.top5_bid_depth + snapshot.top5_ask_depth);
+                    let spread_f64 = snapshot.spread.map(decimal_to_f64).unwrap_or(0.0);
+                    let epoch_seconds = Utc::now().timestamp() as u64;
+
+                    candle_engine.update(midpoint, spread_f64, simulated_volume, epoch_seconds);
+
+                    ticks_since_last_log += 1;
+
+                    if ticks_since_last_log >= 60 {
+                        ticks_since_last_log = 0;
+
+                        let last_5s = candle_engine.get_last_5s();
+                        let last_15s = candle_engine.get_last_15s();
+                        let last_1m = candle_engine.get_last_1m();
+
+                        if let Some(one_minute) = last_1m.filter(|c| Some(c.start_time) != last_logged_1m_start)
+                        {
+                            last_logged_1m_start = Some(one_minute.start_time);
+                            println!(
+                                "[candles] 5s_close={} 15s_close={} 1m_open={:.4} 1m_close={:.4} 1m_volume={:.4}",
+                                display_candle_close(last_5s),
+                                display_candle_close(last_15s),
+                                one_minute.open,
+                                one_minute.close,
+                                one_minute.volume
+                            );
+                        }
+                    }
+                }
 
                 print_snapshot(&watched, &snapshot);
             }
@@ -256,7 +292,9 @@ fn select_yes_token(market: &Market) -> Result<U256> {
             // to keep the watcher running instead of failing discovery loops.
             (outcomes.len() == 2).then_some(0)
         })
-        .with_context(|| format!("preferred outcome token not found in market outcomes: {outcomes:?}"))?;
+        .with_context(|| {
+            format!("preferred outcome token not found in market outcomes: {outcomes:?}")
+        })?;
 
     token_ids
         .get(yes_index)
@@ -274,7 +312,9 @@ async fn fetch_snapshot(client: &clob::Client, token_id: U256) -> Result<MarketS
         }
     };
 
-    let book_request = OrderBookSummaryRequest::builder().token_id(token_id).build();
+    let book_request = OrderBookSummaryRequest::builder()
+        .token_id(token_id)
+        .build();
     let book = client
         .order_book(&book_request)
         .await
@@ -352,14 +392,36 @@ fn market_label(market: &Market) -> String {
 }
 
 fn btc_updown_label_from_question(question: &str) -> String {
-    question
-        .split_once(" - ")
-        .map_or_else(|| question.to_string(), |(_, suffix)| format!("BTC 5m {suffix}"))
+    question.split_once(" - ").map_or_else(
+        || question.to_string(),
+        |(_, suffix)| format!("BTC 5m {suffix}"),
+    )
 }
 
 fn display_decimal(value: Option<Decimal>) -> String {
     value
         .map(|v| format!("{v:.4}"))
+        .unwrap_or_else(|| "N/A".to_string())
+}
+
+fn decimal_to_f64(value: Decimal) -> f64 {
+    value.to_string().parse::<f64>().unwrap_or_default()
+}
+
+fn midpoint_price(snapshot: &MarketSnapshot) -> Option<f64> {
+    if let Some(mid) = snapshot.midpoint {
+        return Some(decimal_to_f64(mid));
+    }
+
+    match (snapshot.best_bid, snapshot.best_ask) {
+        (Some(bid), Some(ask)) => Some((decimal_to_f64(bid) + decimal_to_f64(ask)) / 2.0),
+        _ => None,
+    }
+}
+
+fn display_candle_close(candle: Option<crate::bot::candles::Candle>) -> String {
+    candle
+        .map(|c| format!("{:.4}", c.close))
         .unwrap_or_else(|| "N/A".to_string())
 }
 
@@ -382,18 +444,16 @@ mod tests {
     #[test]
     fn question_matcher_handles_variants() {
         assert!(is_btc_up_down_5m("BTC Up or Down in 5m?"));
-        assert!(is_btc_up_down_5m("Bitcoin up/down over next 5-minute candle"));
+        assert!(is_btc_up_down_5m(
+            "Bitcoin up/down over next 5-minute candle"
+        ));
         assert!(!is_btc_up_down_5m("ETH Up or Down in 5m?"));
     }
 
     #[test]
     fn btc_updown_label_uses_et_question_window() {
-        let label = btc_updown_label_from_question(
-            "Bitcoin Up or Down - February 27, 5:45AM-5:50AM ET",
-        );
+        let label =
+            btc_updown_label_from_question("Bitcoin Up or Down - February 27, 5:45AM-5:50AM ET");
         assert_eq!(label, "BTC 5m February 27, 5:45AM-5:50AM ET");
     }
 }
-
-
-
