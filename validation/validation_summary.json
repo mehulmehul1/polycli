@@ -1,0 +1,152 @@
+{
+  "markets": [
+    {
+      "market_slug": "btc-updown-5m-1772243100",
+      "trades": 2,
+      "total_pnl_percent": 0.261744966442953,
+      "wins": 1,
+      "losses": 0
+    },
+    {
+      "market_slug": "btc-updown-5m-1772243400",
+      "trades": 3,
+      "total_pnl_percent": 0.18778179315092064,
+      "wins": 1,
+      "losses": 2
+    },
+    {
+      "market_slug": "btc-updown-5m-1772243700",
+      "trades": 3,
+      "total_pnl_percent": -0.4339644663284808,
+      "wins": 0,
+      "losses": 3
+    },
+    {
+      "market_slug": "btc-updown-5m-1772244000",
+      "trades": 2,
+      "total_pnl_percent": -0.6441093938647124,
+      "wins": 0,
+      "losses": 2
+    },
+    {
+      "market_slug": "btc-updown-5m-1772244300",
+      "trades": 3,
+      "total_pnl_percent": -0.6010660983624007,
+      "wins": 2,
+      "losses": 0
+    },
+    {
+      "market_slug": "btc-updown-5m-1772244600",
+      "trades": 1,
+      "total_pnl_percent": -0.788911402229804,
+      "wins": 0,
+      "losses": 1
+    },
+    {
+      "market_slug": "btc-updown-5m-1772244900",
+      "trades": 3,
+      "total_pnl_percent": -0.352391834078657,
+      "wins": 3,
+      "losses": 0
+    },
+    {
+      "market_slug": "btc-updown-5m-1772245200",
+      "trades": 1,
+      "total_pnl_percent": -0.4828266166873527,
+      "wins": 0,
+      "losses": 1
+    },
+    {
+      "market_slug": "btc-updown-5m-1772245500",
+      "trades": 2,
+      "total_pnl_percent": -0.438395551064234,
+      "wins": 1,
+      "losses": 1
+    },
+    {
+      "market_slug": "btc-updown-5m-1772245800",
+      "trades": 0,
+      "total_pnl_percent": -0.438395551064234,
+      "wins": 0,
+      "losses": 0
+    },
+    {
+      "market_slug": "btc-updown-5m-1772246100",
+      "trades": 1,
+      "total_pnl_percent": -0.5969321364300877,
+      "wins": 0,
+      "losses": 1
+    },
+    {
+      "market_slug": "btc-updown-5m-1772246400",
+      "trades": 3,
+      "total_pnl_percent": -1.3132712212012807,
+      "wins": 0,
+      "losses": 3
+    },
+    {
+      "market_slug": "btc-updown-5m-1772246700",
+      "trades": 1,
+      "total_pnl_percent": -0.8852712212012805,
+      "wins": 1,
+      "losses": 0
+    },
+    {
+      "market_slug": "btc-updown-5m-1772247000",
+      "trades": 0,
+      "total_pnl_percent": -0.8852712212012805,
+      "wins": 0,
+      "losses": 0
+    },
+    {
+      "market_slug": "btc-updown-5m-1772247300",
+      "trades": 3,
+      "total_pnl_percent": -0.06527122120128037,
+      "wins": 2,
+      "losses": 0
+    },
+    {
+      "market_slug": "btc-updown-5m-1772247600",
+      "trades": 0,
+      "total_pnl_percent": -0.06527122120128037,
+      "wins": 0,
+      "losses": 0
+    },
+    {
+      "market_slug": "btc-updown-5m-1772247900",
+      "trades": 1,
+      "total_pnl_percent": -0.20527122120128036,
+      "wins": 0,
+      "losses": 1
+    },
+    {
+      "market_slug": "btc-updown-5m-1772248200",
+      "trades": 1,
+      "total_pnl_percent": -0.33098550691556605,
+      "wins": 0,
+      "losses": 1
+    },
+    {
+      "market_slug": "btc-updown-5m-1772248500",
+      "trades": 3,
+      "total_pnl_percent": -0.1855309614610206,
+      "wins": 1,
+      "losses": 0
+    },
+    {
+      "market_slug": "btc-updown-5m-1772248800",
+      "trades": 3,
+      "total_pnl_percent": -1.2077171086471676,
+      "wins": 1,
+      "losses": 2
+    }
+  ],
+  "total_trades": 36,
+  "completed_markets": 20,
+  "win_rate_pct": 36.11111111111111,
+  "avg_win_pct": 20.184216844129008,
+  "avg_loss_pct": -21.28702943546633,
+  "total_pnl_pct": -120.77171086471678,
+  "max_win_pct": 42.8,
+  "max_loss_pct": -65.9090909090909
+}

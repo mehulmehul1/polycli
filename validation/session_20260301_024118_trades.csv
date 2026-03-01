@@ -1,0 +1,2 @@
+market_slug,token_side,entry_price,exit_price,pnl_percent,pnl_usd,bankroll_after,duration_seconds
+btc-updown-5m-1772313000,YES,0.4300,0.3700,-13.95,-0.1395,3.86,6

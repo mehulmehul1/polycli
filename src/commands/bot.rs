@@ -1,11 +1,13 @@
 use crate::bot::candles::CandleEngine;
 use crate::bot::indicators::{IndicatorEngine, IndicatorState};
-use crate::bot::signal::{SignalEngine, Bias, EntrySignal, ExitSignal};
+use crate::bot::signal::{SignalEngine, EntrySignal, ExitSignal};
+use crate::bot::validation::ValidationTracker;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Local, Timelike, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use clap::{Args, Subcommand};
 use polymarket_client_sdk::clob;
-use polymarket_client_sdk::clob::types::request::{MidpointRequest, OrderBookSummaryRequest};
+use polymarket_client_sdk::clob::types::request::{MidpointRequest, OrderBookSummaryRequest, PriceRequest};
+use polymarket_client_sdk::clob::types::Side;
 use polymarket_client_sdk::gamma;
 use polymarket_client_sdk::gamma::types::request::{
     MarketBySlugRequest, MarketsRequest, SearchRequest,
@@ -27,12 +29,15 @@ pub struct BotArgs {
 pub enum BotCommand {
     /// Watch the active 5-minute BTC "Up or Down" market and print live orderbook stats
     WatchBtc,
+    /// Automated 20-market validation run with metrics export
+    ValidateBtc,
 }
 
 struct WatchedMarket {
     label: String,
     slug: String,
     yes_token_id: U256,
+    no_token_id: U256,
     end_time: DateTime<Utc>,
 }
 
@@ -45,107 +50,216 @@ struct MarketSnapshot {
     top5_ask_depth: Decimal,
 }
 
-/// Shadow position tracker for simulation mode (NO real orders)
+struct DualSnapshot {
+    yes: MarketSnapshot,
+    no: MarketSnapshot,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TokenSide {
+    Yes,
+    No,
+}
+
 struct ShadowPosition {
-    side: Option<Bias>,
+    active_entry: Option<EntrySignal>,
+    token_side: Option<TokenSide>,
     entry_price: f64,
     size: f64,
     realized_pnl: f64,
-    scale_stage: u8,
+    position_realized_pnl: f64,
+    last_exit_timestamp: u64,
+    entry_timestamp: u64,
+    position_size_usd: f64,
+    bankroll_usd: f64,
+    realized_usd: f64,
+    position_realized_usd: f64,
+    // Directional lock: prevent re-entry after loss in same direction
+    yes_blocked: bool,
+    no_blocked: bool,
 }
 
 impl Default for ShadowPosition {
     fn default() -> Self {
         Self {
-            side: None,
+            active_entry: None,
+            token_side: None,
             entry_price: 0.0,
             size: 0.0,
             realized_pnl: 0.0,
-            scale_stage: 0,
+            position_realized_pnl: 0.0,
+            last_exit_timestamp: 0,
+            entry_timestamp: 0,
+            position_size_usd: 0.0,
+            bankroll_usd: 4.0,
+            realized_usd: 0.0,
+            position_realized_usd: 0.0,
+            yes_blocked: false,
+            no_blocked: false,
         }
     }
 }
 
 impl ShadowPosition {
     fn is_active(&self) -> bool {
-        self.side.is_some()
+        self.token_side.is_some()
     }
 
-    fn reset(&mut self) {
-        self.side = None;
+    fn reset(&mut self, timestamp: u64) {
+        // Block this direction if trade was a loss
+        if self.position_realized_pnl < 0.0 {
+            match self.token_side {
+                Some(TokenSide::Yes) => self.yes_blocked = true,
+                Some(TokenSide::No) => self.no_blocked = true,
+                None => {}
+            }
+        }
+        
+        self.active_entry = None;
+        self.token_side = None;
         self.entry_price = 0.0;
         self.size = 0.0;
-        self.scale_stage = 0;
+        self.position_realized_pnl = 0.0;
+        self.last_exit_timestamp = timestamp;
+        self.position_size_usd = 0.0;
+        self.position_realized_usd = 0.0;
+    }
+
+    fn full_reset(&mut self) {
+        self.active_entry = None;
+        self.token_side = None;
+        self.entry_price = 0.0;
+        self.size = 0.0;
+        self.position_realized_pnl = 0.0;
+        self.last_exit_timestamp = 0;
+        self.entry_timestamp = 0;
+        self.position_size_usd = 0.0;
+        // bankroll_usd carries over - do NOT reset
+        self.position_realized_usd = 0.0;
+        // Clear directional blocks for new contract
+        self.yes_blocked = false;
+        self.no_blocked = false;
     }
 
     fn pnl(&self, current_price: f64) -> f64 {
-        if !self.is_active() {
+        if !self.is_active() || self.entry_price < 0.0001 {
             return 0.0;
         }
-        match self.side {
-            Some(Bias::Long) => current_price - self.entry_price,
-            Some(Bias::Short) => self.entry_price - current_price,
-            Some(Bias::Neutral) => 0.0,
-            None => 0.0,
-        }
+        (current_price - self.entry_price) / self.entry_price
     }
 }
 
 pub async fn execute(args: BotArgs) -> Result<()> {
     match args.command {
-        BotCommand::WatchBtc => watch_btc_market().await,
+        BotCommand::WatchBtc => watch_btc_market(None).await,
+        BotCommand::ValidateBtc => watch_btc_market(Some(20)).await,
     }
 }
 
-async fn watch_btc_market() -> Result<()> {
+async fn watch_btc_market(max_markets: Option<usize>) -> Result<()> {
     let gamma_client = gamma::Client::default();
     let clob_client = clob::Client::default();
 
     let mut watched = discover_market_loop(&gamma_client).await;
 
-    // ========== MULTI-TIMEFRAME INDICATOR ENGINES ==========
+    let mut validator = max_markets.map(ValidationTracker::new);
+
     let mut ind_1m = IndicatorEngine::new();
-    let mut ind_15s = IndicatorEngine::new();
     let mut ind_5s = IndicatorEngine::new();
     let mut signal_engine = SignalEngine::new();
 
     let mut candle_engine = CandleEngine::new();
-    candle_engine.set_debug(false);  // Reduce noise in shadow mode
+    candle_engine.set_debug(false);
 
-    // ========== SHADOW POSITION TRACKER ==========
     let mut shadow = ShadowPosition::default();
 
-    // ========== STATE STORAGE FOR SIGNAL ENGINE ==========
     let mut state_1m = IndicatorState::default();
-    let mut state_15s = IndicatorState::default();
     let mut state_5s = IndicatorState::default();
 
-    // ========== MARKET RESET TRACKING ==========
+    let mut last_midpoint = None;
+    let mut last_yes_bid = 0.0;
+    let mut last_no_bid = 0.0;
     let mut current_slug = watched.slug.clone();
 
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    println!("[SHADOW MODE] Initialized - NO real orders will be placed");
-    println!("[SHADOW MODE] Multi-timeframe: 1m (bias), 15s (accel), 5s (entry)");
+    println!("[SHADOW MODE] Probability Expansion Scalper");
+    println!("[SHADOW MODE] Entry: slope > 0.002 + breakout | Exit: slope flip");
+    println!("[SHADOW MODE] Range: 0.35 - 0.65 | Spread: < 10% of ask");
     println!("========================================");
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 println!("\n[SHADOW] Final PnL: {:.4}%", shadow.realized_pnl * 100.0);
+                if let Some(v) = &validator {
+                    v.print_summary();
+                }
                 println!("Received Ctrl+C, stopping bot watch.");
                 break;
             }
             _ = ticker.tick() => {
-                // ========== MARKET ROLL DETECTION & RESET ==========
                 if Utc::now() >= watched.end_time || watched.slug != current_slug {
-                    // Print final shadow state before reset
                     if shadow.is_active() {
+                        // Use correct side's bid for settlement (not YES midpoint for all!)
+                        let price = match shadow.token_side {
+                            Some(TokenSide::Yes) => last_yes_bid,
+                            Some(TokenSide::No) => last_no_bid,
+                            None => shadow.entry_price,
+                        };
+                        
+                        // If price is near 0, the side lost - settle at 0
+                        // If price is near 1, the side won - settle at 1
+                        let settlement_price = if price > 0.5 { 1.0 } else { 0.0 };
+                        
+                        let final_pnl = shadow.pnl(settlement_price);
+                        shadow.realized_pnl += final_pnl * shadow.size;
+                        shadow.position_realized_pnl += final_pnl * shadow.size;
+
+                        let dollar_pnl = final_pnl * shadow.position_size_usd;
+                        shadow.bankroll_usd += shadow.position_size_usd + dollar_pnl;
+                        shadow.realized_usd += dollar_pnl;
+                        shadow.position_realized_usd += dollar_pnl;
+
+                        if let Some(v) = &mut validator {
+                            let duration = (Utc::now().timestamp() as u64 - shadow.entry_timestamp) as i64;
+                            let side_str = match shadow.token_side {
+                                Some(TokenSide::Yes) => "YES".to_string(),
+                                Some(TokenSide::No) => "NO".to_string(),
+                                None => "N/A".to_string(),
+                            };
+                            v.record_trade(
+                                watched.slug.clone(),
+                                side_str,
+                                shadow.entry_price,
+                                settlement_price,
+                                shadow.position_realized_pnl,
+                                duration,
+                                shadow.position_realized_usd,
+                                shadow.bankroll_usd,
+                            );
+                        }
+
+                        let side_name = match shadow.token_side {
+                            Some(TokenSide::Yes) => "YES",
+                            Some(TokenSide::No) => "NO",
+                            None => "N/A",
+                        };
                         println!(
-                            "[SHADOW] Contract rollover - Forced close | PnL: {:.4}%",
-                            shadow.realized_pnl * 100.0
+                            "[SETTLEMENT] {} | {} @ {:.2} → {:.2} | {:.4}% | Bankroll: ${:.2}",
+                            side_name, watched.slug, shadow.entry_price, settlement_price, 
+                            shadow.position_realized_pnl * 100.0, shadow.bankroll_usd
                         );
+                    }
+
+                    if let Some(v) = &mut validator {
+                        v.finalize_market(watched.slug.clone(), shadow.realized_pnl);
+                        
+                        if v.completed_markets >= v.max_markets {
+                            v.print_summary();
+                            return Ok(());
+                        }
                     }
 
                     println!(
@@ -155,164 +269,311 @@ async fn watch_btc_market() -> Result<()> {
                     watched = discover_market_loop(&gamma_client).await;
                     current_slug = watched.slug.clone();
 
-                    // ========== CRITICAL: RESET ALL STATE ON MARKET ROLL ==========
-                    signal_engine = SignalEngine::new();
+                    signal_engine.reset();
                     ind_1m.reset();
-                    ind_15s.reset();
                     ind_5s.reset();
-                    shadow.reset();
+                    shadow.full_reset();
                     state_1m = IndicatorState::default();
-                    state_15s = IndicatorState::default();
                     state_5s = IndicatorState::default();
+                    last_midpoint = None;
+                    last_yes_bid = 0.0;
+                    last_no_bid = 0.0;
 
-                    println!("[MARKET RESET] All engines and shadow position cleared | {}", watched.slug);
+                    println!("[MARKET RESET] All engines cleared | {}", watched.slug);
                     println!("========================================");
                 }
 
-                let snapshot = match fetch_snapshot(&clob_client, watched.yes_token_id).await {
-                    Ok(snapshot) => snapshot,
+                let yes_snapshot = match fetch_snapshot(&clob_client, watched.yes_token_id).await {
+                    Ok(s) => s,
                     Err(err) => {
-                        eprintln!("[warn] Failed to fetch market data for {}: {err:#}", watched.slug);
+                        eprintln!("[warn] Failed to fetch YES market data: {err:#}");
+                        continue;
+                    }
+                };
+                let no_snapshot = match fetch_snapshot(&clob_client, watched.no_token_id).await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        eprintln!("[warn] Failed to fetch NO market data: {err:#}");
                         continue;
                     }
                 };
 
-                if let Some(midpoint) = midpoint_price(&snapshot) {
-                    let simulated_volume = decimal_to_f64(snapshot.top5_bid_depth + snapshot.top5_ask_depth);
-                    let spread_f64 = snapshot.spread.map(decimal_to_f64).unwrap_or(0.0);
+                let dual_snapshot = DualSnapshot {
+                    yes: yes_snapshot,
+                    no: no_snapshot,
+                };
+
+                if let Some(midpoint) = midpoint_price(&dual_snapshot.yes) {
+                    last_midpoint = Some(midpoint);
+                    last_yes_bid = best_bid_price(&dual_snapshot.yes).unwrap_or(last_yes_bid);
+                    last_no_bid = best_bid_price(&dual_snapshot.no).unwrap_or(last_no_bid);
+                    let simulated_volume = decimal_to_f64(dual_snapshot.yes.top5_bid_depth + dual_snapshot.yes.top5_ask_depth);
+                    let spread_f64 = dual_snapshot.yes.spread.map(decimal_to_f64).unwrap_or(0.0);
                     let epoch_seconds = Utc::now().timestamp() as u64;
 
-                    // ========== UPDATE INDICATORS ON CANDLE CLOSE ==========
+                    // Periodic book state output every 10s
+                    if epoch_seconds % 10 == 0 {
+                        let yes_bid = best_bid_price(&dual_snapshot.yes).unwrap_or(0.0);
+                        let yes_ask = best_ask_price(&dual_snapshot.yes).unwrap_or(0.0);
+                        let no_bid = best_bid_price(&dual_snapshot.no).unwrap_or(0.0);
+                        let no_ask = best_ask_price(&dual_snapshot.no).unwrap_or(0.0);
+                        let yes_spread = yes_ask - yes_bid;
+                        let no_spread = no_ask - no_bid;
+                        let yes_max = yes_ask * 0.10;
+                        let no_max = no_ask * 0.10;
+                        println!("[BOOK] YES: bid={:.4} ask={:.4} spread={:.4} max={:.4} | NO: bid={:.4} ask={:.4} spread={:.4} max={:.4} | mid={:.4}", 
+                            yes_bid, yes_ask, yes_spread, yes_max, no_bid, no_ask, no_spread, no_max, midpoint);
+                    }
+
                     let closed_candles = candle_engine.update(midpoint, spread_f64, simulated_volume, epoch_seconds);
 
                     if let Some(closed) = closed_candles {
-                        // Update 15s indicators
-                        if let Some(c) = closed.fifteen_second {
-                            state_15s = ind_15s.update(&c);
-                        }
-
-                        // Update 1m indicators
                         if let Some(c) = closed.one_minute {
                             state_1m = ind_1m.update(&c);
                         }
 
-                        // Update 5s indicators and evaluate signals
                         if let Some(c) = closed.five_second {
                             state_5s = ind_5s.update(&c);
 
-                            let prev_bias = shadow.side;
-                            
-                            // ========== SIGNAL ENGINE EVALUATION (on 5s close only) ==========
-                            let signal = signal_engine.update(
-                                &state_1m,
-                                &state_15s,
+                            let mut signal = signal_engine.update(
                                 &state_5s,
+                                &state_1m,
                                 midpoint
                             );
 
-                            // ========== BIAS CHANGE LOGGING ==========
-                            if signal.bias != prev_bias.unwrap_or(Bias::Neutral) && signal.bias != Bias::Neutral {
-                                println!("[BIAS CHANGE] {:?} -> {:?}", prev_bias, signal.bias);
+                            if signal.entry != EntrySignal::None {
+                                if let Some(v) = &mut validator {
+                                    v.record_signal();
+                                }
                             }
 
-                            // ========== SHADOW EXECUTION LAYER ==========
-                            handle_shadow_signals(&signal, midpoint, &mut shadow, &watched);
+                            if signal.entry != EntrySignal::None {
+                                let contract_age = (epoch_seconds as i64) - (watched.end_time.timestamp() - FIVE_MINUTES_SECONDS);
+                                let time_remaining = (watched.end_time.timestamp() - epoch_seconds as i64).max(0);
+                                
+                                let snapshot_side = match signal.entry {
+                                    EntrySignal::Long => &dual_snapshot.yes,
+                                    EntrySignal::Short => &dual_snapshot.no,
+                                    _ => &dual_snapshot.yes,
+                                };
+
+                                let yes_ask = best_ask_price(&dual_snapshot.yes).unwrap_or(0.0);
+                                let no_ask = best_ask_price(&dual_snapshot.no).unwrap_or(0.0);
+
+                                let side_bid = best_bid_price(snapshot_side).unwrap_or(0.0);
+                                let side_ask = best_ask_price(snapshot_side).unwrap_or(0.0);
+                                let side_spread = side_ask - side_bid;
+                                let max_spread = side_ask * 0.10;
+
+                                if let Err(reason) = trade_allowed(
+                                    snapshot_side,
+                                    time_remaining,
+                                    contract_age,
+                                    yes_ask,
+                                    no_ask,
+                                ) {
+                                    println!("[FILTER BLOCKED ENTRY] {} | {} Side | Reason: {:?} | bid={:.4} ask={:.4} spread={:.4} max={:.4}", 
+                                        watched.slug, 
+                                        if matches!(signal.entry, EntrySignal::Long) { "YES" } else { "NO" }, 
+                                        reason,
+                                        side_bid,
+                                        side_ask,
+                                        side_spread,
+                                        max_spread
+                                    );
+                                    signal.entry = EntrySignal::None;
+                                    if let Some(v) = &mut validator {
+                                        v.record_entry_blocked();
+                                    }
+                                }
+                            }
+
+                            handle_shadow_signals(
+                                &signal, 
+                                &dual_snapshot, 
+                                &mut shadow, 
+                                &watched, 
+                                epoch_seconds, 
+                                &mut validator,
+                                midpoint
+                            );
                         }
                     }
 
-                    // ========== SHADOW PnL TICKER (every 30 seconds) ==========
                     if shadow.is_active() {
-                        let unrealized = shadow.pnl(midpoint);
+                        let exit_price = match shadow.token_side {
+                            Some(TokenSide::Yes) => best_bid_price(&dual_snapshot.yes).unwrap_or(0.0),
+                            Some(TokenSide::No) => best_bid_price(&dual_snapshot.no).unwrap_or(0.0),
+                            _ => 0.0,
+                        };
+                        
+                        let unrealized = shadow.pnl(exit_price) * shadow.size;
                         let total = shadow.realized_pnl + unrealized;
-                        // Only log periodically, not every tick
                         if epoch_seconds % 30 == 0 {
+                            let yes_bid = best_bid_price(&dual_snapshot.yes).unwrap_or(0.0);
+                            let yes_ask = best_ask_price(&dual_snapshot.yes).unwrap_or(0.0);
+                            let no_bid = best_bid_price(&dual_snapshot.no).unwrap_or(0.0);
+                            let no_ask = best_ask_price(&dual_snapshot.no).unwrap_or(0.0);
+                            
                             println!(
-                                "[SHADOW TICK] {:?} @ {:.4} | Unrealized: {:.4}% | Total: {:.4}%",
-                                shadow.side.unwrap(), midpoint, unrealized * 100.0, total * 100.0
+                                "[BOOK] YES {:.4}/{:.4} | NO {:.4}/{:.4} | sum={:.4}",
+                                yes_bid, yes_ask, no_bid, no_ask, yes_ask + no_ask
+                            );
+                            println!(
+                                "[TICK] {:?} entry={:.4} current={:.4} | PnL: {:.4}% | Total: {:.4}%",
+                                shadow.token_side.unwrap(), shadow.entry_price, exit_price, unrealized * 100.0, total * 100.0
                             );
                         }
                     }
                 }
-
-                // print_snapshot(&watched, &snapshot);
             }
         }
     }
-
     Ok(())
 }
 
-/// Handle signal events in shadow mode (NO real orders)
 fn handle_shadow_signals(
     signal: &crate::bot::signal::SignalState,
-    price: f64,
+    dual_snapshot: &DualSnapshot,
     shadow: &mut ShadowPosition,
     market: &WatchedMarket,
+    timestamp: u64,
+    validator: &mut Option<ValidationTracker>,
+    midpoint: f64,
 ) {
-    // ========== ENTRY HANDLING ==========
-    match signal.entry {
-        EntrySignal::Long => {
-            if !shadow.is_active() {
-                shadow.side = Some(Bias::Long);
+    let time_remaining = (market.end_time.timestamp() - Utc::now().timestamp()).max(0);
+
+    if signal.entry != EntrySignal::None && !shadow.is_active() {
+        if time_remaining < 30 || time_remaining > 280 {
+            return;
+        }
+
+        if timestamp - shadow.last_exit_timestamp < 15 {
+            return;
+        }
+
+        // Directional lock: don't re-enter same direction after loss
+        match signal.entry {
+            EntrySignal::Long if shadow.yes_blocked => {
+                println!("[BLOCKED] YES direction locked after loss");
+                return;
+            }
+            EntrySignal::Short if shadow.no_blocked => {
+                println!("[BLOCKED] NO direction locked after loss");
+                return;
+            }
+            _ => {}
+        }
+
+        if shadow.bankroll_usd < 1.0 {
+            println!("[BANKROLL BLOCKED] ${:.2}", shadow.bankroll_usd);
+            return;
+        }
+
+        shadow.token_side = match signal.entry {
+            EntrySignal::Long => Some(TokenSide::Yes),
+            EntrySignal::Short => Some(TokenSide::No),
+            EntrySignal::None => None,
+        };
+
+        let entry_price = match shadow.token_side {
+            Some(TokenSide::Yes) => best_ask_price(&dual_snapshot.yes),
+            Some(TokenSide::No) => best_ask_price(&dual_snapshot.no),
+            _ => None,
+        };
+
+        match entry_price {
+            Some(price) if price > 0.0001 => {
+                shadow.active_entry = Some(signal.entry);
                 shadow.entry_price = price;
                 shadow.size = 1.0;
-                shadow.scale_stage = 0;
+                shadow.position_realized_pnl = 0.0;
+                shadow.entry_timestamp = timestamp;
+                shadow.position_size_usd = 1.0;
+                shadow.bankroll_usd -= 1.0;
+                shadow.position_realized_usd = 0.0;
+
+                if let Some(v) = validator {
+                    v.record_entry_taken();
+                }
+
+                let side_name = match shadow.token_side {
+                    Some(TokenSide::Yes) => "YES",
+                    Some(TokenSide::No) => "NO",
+                    None => "N/A",
+                };
+                
+                let yes_bid = best_bid_price(&dual_snapshot.yes).unwrap_or(0.0);
+                let yes_ask = best_ask_price(&dual_snapshot.yes).unwrap_or(0.0);
+                let no_bid = best_bid_price(&dual_snapshot.no).unwrap_or(0.0);
+                let no_ask = best_ask_price(&dual_snapshot.no).unwrap_or(0.0);
+                
                 println!(
-                    "[SHADOW ENTRY] {} | LONG @ {:.4} | Time Remaining: {}s",
-                    market.label, price, (market.end_time - Utc::now()).num_seconds().max(0)
+                    "[BOOK] YES {:.4}/{:.4} | NO {:.4}/{:.4} | sum={:.4}",
+                    yes_bid, yes_ask, no_bid, no_ask, yes_ask + no_ask
+                );
+                println!(
+                    "[ENTRY] {} | {} @ {:.4} (mid={:.4}) | Bankroll: ${:.2}",
+                    market.label, side_name, price, midpoint, shadow.bankroll_usd
                 );
             }
-        }
-        EntrySignal::Short => {
-            if !shadow.is_active() {
-                shadow.side = Some(Bias::Short);
-                shadow.entry_price = price;
-                shadow.size = 1.0;
-                shadow.scale_stage = 0;
-                println!(
-                    "[SHADOW ENTRY] {} | SHORT @ {:.4} | Time Remaining: {}s",
-                    market.label, price, (market.end_time - Utc::now()).num_seconds().max(0)
-                );
+            _ => {
+                println!("[NO LIQUIDITY] No best_ask for {:?}", shadow.token_side);
             }
         }
-        EntrySignal::None => {}
+        return;
     }
 
-    // ========== EXIT HANDLING ==========
+    let exit_price = match shadow.token_side {
+        Some(TokenSide::Yes) => best_bid_price(&dual_snapshot.yes),
+        Some(TokenSide::No) => best_bid_price(&dual_snapshot.no),
+        _ => None,
+    };
+
     match signal.exit {
-        ExitSignal::ScaleOut25 => {
-            if shadow.is_active() && shadow.scale_stage == 0 {
-                let pnl = shadow.pnl(price);
-                shadow.realized_pnl += pnl * 0.25;
-                shadow.scale_stage = 1;
-                println!(
-                    "[SHADOW SCALE 25%] {} | @ {:.4} | Trade PnL: {:.4}% | Total: {:.4}%",
-                    market.label, price, pnl * 100.0, shadow.realized_pnl * 100.0
-                );
-            }
-        }
-        ExitSignal::ScaleOut50 => {
-            if shadow.is_active() && shadow.scale_stage < 2 {
-                let remaining = if shadow.scale_stage == 0 { 1.0 } else { 0.75 };
-                let pnl = shadow.pnl(price);
-                shadow.realized_pnl += pnl * remaining * 0.5;
-                shadow.scale_stage = 2;
-                println!(
-                    "[SHADOW SCALE 50%] {} | @ {:.4} | Trade PnL: {:.4}% | Total: {:.4}%",
-                    market.label, price, pnl * 100.0, shadow.realized_pnl * 100.0
-                );
-            }
-        }
-        ExitSignal::FullExit | ExitSignal::StopLoss => {
+        ExitSignal::FullExit => {
             if shadow.is_active() {
-                let pnl = shadow.pnl(price);
-                shadow.realized_pnl += pnl;
-                let exit_type = if signal.exit == ExitSignal::StopLoss { "STOP LOSS" } else { "FULL EXIT" };
-                println!(
-                    "[SHADOW {}] {} | {:?} @ {:.4} | Trade PnL: {:.4}% | Total: {:.4}%",
-                    exit_type, market.label, shadow.side, price, pnl * 100.0, shadow.realized_pnl * 100.0
-                );
-                shadow.reset();
+                match exit_price {
+                    Some(price) if price > 0.0001 => {
+                        let pnl = shadow.pnl(price);
+                        let realized = pnl * shadow.size;
+                        shadow.realized_pnl += realized;
+                        shadow.position_realized_pnl += realized;
+                        
+                        let dollar_pnl = pnl * shadow.position_size_usd;
+                        shadow.bankroll_usd += shadow.position_size_usd + dollar_pnl;
+                        shadow.realized_usd += dollar_pnl;
+                        shadow.position_realized_usd += dollar_pnl;
+                        
+                        if let Some(v) = validator {
+                            let duration = (timestamp - shadow.entry_timestamp) as i64;
+                            let side_str = match shadow.token_side {
+                                Some(TokenSide::Yes) => "YES".to_string(),
+                                Some(TokenSide::No) => "NO".to_string(),
+                                None => "N/A".to_string(),
+                            };
+                            v.record_trade(
+                                market.slug.clone(),
+                                side_str,
+                                shadow.entry_price,
+                                price,
+                                shadow.position_realized_pnl,
+                                duration,
+                                shadow.position_realized_usd,
+                                shadow.bankroll_usd,
+                            );
+                        }
+
+                        println!(
+                            "[EXIT SLOPE FLIP] {} | {:.4}% | +${:.4} | Bankroll: ${:.2}",
+                            market.label, shadow.position_realized_pnl * 100.0, shadow.position_realized_usd, shadow.bankroll_usd
+                        );
+                        shadow.reset(timestamp);
+                    }
+                    _ => {
+                        println!("[NO EXIT BID] {:?}", shadow.token_side);
+                    }
+                }
             }
         }
         ExitSignal::None => {}
@@ -324,13 +585,13 @@ async fn discover_market_loop(client: &gamma::Client) -> WatchedMarket {
         match discover_active_btc_market(client).await {
             Ok(market) => {
                 println!(
-                    "Watching market: {} [{}] (YES token {})",
-                    market.label, market.slug, market.yes_token_id
+                    "Watching: {} [{}] (YES {}, NO {})",
+                    market.label, market.slug, market.yes_token_id, market.no_token_id
                 );
                 return market;
             }
             Err(err) => {
-                eprintln!("[warn] Could not find active BTC 5m market yet: {err:#}");
+                eprintln!("[warn] Could not find active BTC 5m market: {err:#}");
                 sleep(Duration::from_secs(2)).await;
             }
         }
@@ -357,7 +618,7 @@ async fn discover_active_btc_market(client: &gamma::Client) -> Result<WatchedMar
     match market {
         Some(market) => market_to_watched(market),
         None => Err(anyhow::anyhow!(
-            "no matching active BTC 5m market found by slug probes or fallback search"
+            "no matching active BTC 5m market found"
         )),
     }
 }
@@ -444,58 +705,52 @@ fn is_active_now(market: &Market, now: &DateTime<Utc>) -> bool {
 }
 
 fn market_to_watched(market: Market) -> Result<WatchedMarket> {
-    let yes_token_id = select_yes_token(&market)?;
+    let (yes_token_id, no_token_id) = select_binary_tokens(&market)?;
     let fallback_slug = format!("market-{}", market.id);
     let end_time = market
         .end_date
-        .context("market end date is missing; cannot compute time remaining")?;
+        .context("market end date is missing")?;
 
     Ok(WatchedMarket {
         label: market_label(&market),
         slug: market.slug.unwrap_or(fallback_slug),
         yes_token_id,
+        no_token_id,
         end_time,
     })
 }
 
-fn select_yes_token(market: &Market) -> Result<U256> {
+fn select_binary_tokens(market: &Market) -> Result<(U256, U256)> {
     let outcomes = market
         .outcomes
         .as_ref()
         .context("market outcomes missing")?;
+
     let token_ids = market
         .clob_token_ids
         .as_ref()
         .context("market CLOB token IDs missing")?;
 
-    if outcomes.len() != token_ids.len() {
-        anyhow::bail!(
-            "outcomes/token id length mismatch ({} outcomes vs {} token IDs)",
-            outcomes.len(),
-            token_ids.len()
-        );
+    if outcomes.len() != token_ids.len() || outcomes.len() != 2 {
+        anyhow::bail!("binary market expected exactly 2 outcomes");
     }
 
-    let yes_index = outcomes
-        .iter()
-        .position(|outcome| {
-            outcome.eq_ignore_ascii_case("yes")
-                || outcome.eq_ignore_ascii_case("up")
-                || outcome.eq_ignore_ascii_case("higher")
-        })
-        .or_else(|| {
-            // Some up/down markets may use directional labels; prefer index 0 in a binary market
-            // to keep the watcher running instead of failing discovery loops.
-            (outcomes.len() == 2).then_some(0)
-        })
-        .with_context(|| {
-            format!("preferred outcome token not found in market outcomes: {outcomes:?}")
-        })?;
+    let mut yes_index = None;
+    let mut no_index = None;
 
-    token_ids
-        .get(yes_index)
-        .copied()
-        .context("YES token ID missing at matched outcome index")
+    for (i, outcome) in outcomes.iter().enumerate() {
+        let normalized = outcome.to_ascii_lowercase();
+        if normalized.contains("yes") || normalized.contains("up") || normalized.contains("higher") {
+            yes_index = Some(i);
+        } else {
+            no_index = Some(i);
+        }
+    }
+
+    let yes_index = yes_index.context("YES outcome not found")?;
+    let no_index = no_index.context("NO outcome not found")?;
+
+    Ok((token_ids[yes_index], token_ids[no_index]))
 }
 
 async fn fetch_snapshot(client: &clob::Client, token_id: U256) -> Result<MarketSnapshot> {
@@ -508,19 +763,55 @@ async fn fetch_snapshot(client: &clob::Client, token_id: U256) -> Result<MarketS
         }
     };
 
-    let book_request = OrderBookSummaryRequest::builder()
+    // Use price API for actual tradable prices
+    // Side::Buy = price to buy at = ask
+    // Side::Sell = price to sell at = bid
+    let sell_request = PriceRequest::builder()
         .token_id(token_id)
+        .side(Side::Sell)
         .build();
-    let book = client
-        .order_book(&book_request)
-        .await
-        .context("order book request failed")?;
+    let best_ask = match client.price(&sell_request).await {
+        Ok(resp) => Some(resp.price),
+        Err(err) => {
+            eprintln!("[warn] sell price request failed: {err}");
+            None
+        }
+    };
 
-    let best_bid = book.bids.first().map(|order| order.price);
-    let best_ask = book.asks.first().map(|order| order.price);
+    let buy_request = PriceRequest::builder()
+        .token_id(token_id)
+        .side(Side::Buy)
+        .build();
+    let best_bid = match client.price(&buy_request).await {
+        Ok(resp) => Some(resp.price),
+        Err(err) => {
+            eprintln!("[warn] buy price request failed: {err}");
+            None
+        }
+    };
+
     let spread = match (best_bid, best_ask) {
         (Some(bid), Some(ask)) => Some(ask - bid),
         _ => None,
+    };
+
+    // Get depth from order book (still useful for liquidity assessment)
+    let book_request = OrderBookSummaryRequest::builder()
+        .token_id(token_id)
+        .build();
+    let book = match client.order_book(&book_request).await {
+        Ok(b) => b,
+        Err(err) => {
+            eprintln!("[warn] order book request failed: {err}");
+            return Ok(MarketSnapshot {
+                midpoint,
+                best_bid,
+                best_ask,
+                spread,
+                top5_bid_depth: Decimal::ZERO,
+                top5_ask_depth: Decimal::ZERO,
+            });
+        }
     };
 
     let top5_bid_depth = book
@@ -542,22 +833,6 @@ async fn fetch_snapshot(client: &clob::Client, token_id: U256) -> Result<MarketS
         top5_bid_depth,
         top5_ask_depth,
     })
-}
-
-fn print_snapshot(market: &WatchedMarket, snapshot: &MarketSnapshot) {
-    let now_local = Local::now();
-    let remaining_seconds = (market.end_time - Utc::now()).num_seconds().max(0);
-
-    println!("Time: {}", now_local.format("%H:%M:%S"));
-    println!("Market: {}", market.label);
-    println!("Mid: {}", display_decimal(snapshot.midpoint));
-    println!("Best Bid: {}", display_decimal(snapshot.best_bid));
-    println!("Best Ask: {}", display_decimal(snapshot.best_ask));
-    println!("Spread: {}", display_decimal(snapshot.spread));
-    println!("Bid Depth (top 5): {:.4}", snapshot.top5_bid_depth);
-    println!("Ask Depth (top 5): {:.4}", snapshot.top5_ask_depth);
-    println!("Time Remaining: {remaining_seconds}s");
-    println!("----------------------------------");
 }
 
 fn market_label(market: &Market) -> String {
@@ -594,14 +869,68 @@ fn btc_updown_label_from_question(question: &str) -> String {
     )
 }
 
-fn display_decimal(value: Option<Decimal>) -> String {
-    value
-        .map(|v| format!("{v:.4}"))
-        .unwrap_or_else(|| "N/A".to_string())
-}
-
 fn decimal_to_f64(value: Decimal) -> f64 {
     value.to_string().parse::<f64>().unwrap_or_default()
+}
+
+#[derive(Debug, PartialEq)]
+enum FilterReason {
+    NoLiquidity,
+    WideSpread,
+    ExtremePrice,
+    BrokenBook,
+    Time,
+}
+
+fn trade_allowed(
+    snapshot: &MarketSnapshot,
+    time_remaining: i64,
+    contract_age: i64,
+    yes_ask: f64,
+    no_ask: f64,
+) -> Result<(), FilterReason> {
+    let best_bid = snapshot.best_bid.map(decimal_to_f64);
+    let best_ask = snapshot.best_ask.map(decimal_to_f64);
+
+    if best_bid.is_none() || best_ask.is_none() {
+        return Err(FilterReason::NoLiquidity);
+    }
+
+    let bid = best_bid.unwrap();
+    let ask = best_ask.unwrap();
+
+    // Dynamic spread cap: 10% of ask price, minimum 3 cents
+    // At 0.50: max 0.05, at 0.30: max 0.03, at 0.10: max 0.03 (floor)
+    let spread = ask - bid;
+    let max_spread = (ask * 0.10).max(0.03);
+    if spread > max_spread {
+        return Err(FilterReason::WideSpread);
+    }
+
+    // Only trade mid-range probabilities (0.35-0.65)
+    if ask > 0.65 || ask < 0.35 {
+        return Err(FilterReason::ExtremePrice);
+    }
+
+    // Complement sanity check: YES + NO should ≈ 1
+    if (yes_ask + no_ask - 1.0).abs() > 0.10 {
+        return Err(FilterReason::BrokenBook);
+    }
+
+    // Need enough time for expansion
+    if time_remaining < 30 || contract_age < 15 {
+        return Err(FilterReason::Time);
+    }
+
+    Ok(())
+}
+
+fn best_ask_price(snapshot: &MarketSnapshot) -> Option<f64> {
+    snapshot.best_ask.map(decimal_to_f64)
+}
+
+fn best_bid_price(snapshot: &MarketSnapshot) -> Option<f64> {
+    snapshot.best_bid.map(decimal_to_f64)
 }
 
 fn midpoint_price(snapshot: &MarketSnapshot) -> Option<f64> {
@@ -613,12 +942,6 @@ fn midpoint_price(snapshot: &MarketSnapshot) -> Option<f64> {
         (Some(bid), Some(ask)) => Some((decimal_to_f64(bid) + decimal_to_f64(ask)) / 2.0),
         _ => None,
     }
-}
-
-fn display_candle_close(candle: Option<crate::bot::candles::Candle>) -> String {
-    candle
-        .map(|c| format!("{:.4}", c.close))
-        .unwrap_or_else(|| "N/A".to_string())
 }
 
 #[cfg(test)]
@@ -651,5 +974,59 @@ mod tests {
         let label =
             btc_updown_label_from_question("Bitcoin Up or Down - February 27, 5:45AM-5:50AM ET");
         assert_eq!(label, "BTC 5m February 27, 5:45AM-5:50AM ET");
+    }
+
+    #[test]
+    fn trade_allowed_passes_good_conditions() {
+        let snapshot = MarketSnapshot {
+            midpoint: Some(Decimal::new(50, 2)),
+            best_bid: Some(Decimal::new(47, 2)),
+            best_ask: Some(Decimal::new(50, 2)),
+            spread: Some(Decimal::new(3, 2)),
+            top5_bid_depth: Decimal::new(50000, 2),
+            top5_ask_depth: Decimal::new(50000, 2),
+        };
+        // yes_ask=0.50, no_ask=0.50, sum=1.0, passes complement
+        assert!(trade_allowed(&snapshot, 60, 30, 0.50, 0.50).is_ok());
+    }
+
+    #[test]
+    fn trade_allowed_blocks_wide_spread() {
+        let snapshot = MarketSnapshot {
+            midpoint: Some(Decimal::new(50, 2)),
+            best_bid: Some(Decimal::new(40, 2)),
+            best_ask: Some(Decimal::new(60, 2)),
+            spread: Some(Decimal::new(20, 2)),
+            top5_bid_depth: Decimal::new(50000, 2),
+            top5_ask_depth: Decimal::new(50000, 2),
+        };
+        assert_eq!(trade_allowed(&snapshot, 60, 30, 0.60, 0.40), Err(FilterReason::WideSpread));
+    }
+
+    #[test]
+    fn trade_allowed_blocks_extreme_price() {
+        let snapshot = MarketSnapshot {
+            midpoint: Some(Decimal::new(85, 2)),
+            best_bid: Some(Decimal::new(84, 2)),
+            best_ask: Some(Decimal::new(86, 2)),
+            spread: Some(Decimal::new(2, 2)),
+            top5_bid_depth: Decimal::new(50000, 2),
+            top5_ask_depth: Decimal::new(50000, 2),
+        };
+        assert_eq!(trade_allowed(&snapshot, 60, 30, 0.86, 0.14), Err(FilterReason::ExtremePrice));
+    }
+
+    #[test]
+    fn trade_allowed_blocks_broken_book() {
+        let snapshot = MarketSnapshot {
+            midpoint: Some(Decimal::new(50, 2)),
+            best_bid: Some(Decimal::new(49, 2)),
+            best_ask: Some(Decimal::new(51, 2)),
+            spread: Some(Decimal::new(2, 2)),
+            top5_bid_depth: Decimal::new(50000, 2),
+            top5_ask_depth: Decimal::new(50000, 2),
+        };
+        // YES=0.99, NO=0.99, sum=1.98 - broken book
+        assert_eq!(trade_allowed(&snapshot, 60, 30, 0.99, 0.99), Err(FilterReason::BrokenBook));
     }
 }

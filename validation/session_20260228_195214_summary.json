@@ -1,0 +1,30 @@
+{
+  "markets": [
+    {
+      "market_slug": "btc-updown-5m-1772288400",
+      "trades": 0,
+      "total_pnl_percent": 0.0,
+      "wins": 0,
+      "losses": 0
+    },
+    {
+      "market_slug": "btc-updown-5m-1772288700",
+      "trades": 1,
+      "total_pnl_percent": -0.17391304347826084,
+      "wins": 0,
+      "losses": 1
+    }
+  ],
+  "total_trades": 1,
+  "completed_markets": 2,
+  "win_rate_pct": 0.0,
+  "avg_win_pct": 0.0,
+  "avg_loss_pct": -17.391304347826082,
+  "total_pnl_pct": -17.391304347826082,
+  "max_win_pct": 0.0,
+  "max_loss_pct": -17.391304347826082,
+  "starting_capital_usd": 4.0,
+  "ending_capital_usd": 3.8260869565217392,
+  "net_profit_usd": -0.17391304347826084,
+  "return_on_capital_pct": -4.347826086956521
+}

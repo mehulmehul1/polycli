@@ -1,0 +1,8 @@
+market_slug,token_side,entry_price,exit_price,pnl_percent,pnl_usd,bankroll_after,duration_seconds
+btc-updown-5m-1772318700,YES,0.5100,0.9700,90.20,0.9020,4.90,199
+btc-updown-5m-1772319300,YES,0.5200,0.4300,-17.31,-0.1731,4.73,63
+btc-updown-5m-1772319600,YES,0.5900,0.4400,-25.42,-0.2542,4.47,48
+btc-updown-5m-1772319600,NO (ROLL),0.4400,0.0050,-98.86,-0.9886,3.49,133
+btc-updown-5m-1772319900,YES (ROLL),0.6300,0.9950,57.94,0.5794,4.07,227
+btc-updown-5m-1772320200,NO,0.6400,0.5100,-20.31,-0.2031,3.86,51
+btc-updown-5m-1772320200,NO (ROLL),0.5800,0.0050,-99.14,-0.9914,2.87,196

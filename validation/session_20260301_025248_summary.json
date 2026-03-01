@@ -1,0 +1,76 @@
+{
+  "markets": [
+    {
+      "market_slug": "btc-updown-5m-1772313600",
+      "trades": 0,
+      "total_pnl_percent": 0.0,
+      "wins": 0,
+      "losses": 0
+    },
+    {
+      "market_slug": "btc-updown-5m-1772313900",
+      "trades": 2,
+      "total_pnl_percent": 0.0916570991197856,
+      "wins": 1,
+      "losses": 1
+    },
+    {
+      "market_slug": "btc-updown-5m-1772314200",
+      "trades": 5,
+      "total_pnl_percent": -1.2281009495740636,
+      "wins": 0,
+      "losses": 5
+    },
+    {
+      "market_slug": "btc-updown-5m-1772314500",
+      "trades": 0,
+      "total_pnl_percent": -1.2281009495740636,
+      "wins": 0,
+      "losses": 0
+    },
+    {
+      "market_slug": "btc-updown-5m-1772314800",
+      "trades": 3,
+      "total_pnl_percent": -1.2572659809712379,
+      "wins": 1,
+      "losses": 2
+    },
+    {
+      "market_slug": "btc-updown-5m-1772315100",
+      "trades": 4,
+      "total_pnl_percent": -1.7140294555918554,
+      "wins": 1,
+      "losses": 3
+    },
+    {
+      "market_slug": "btc-updown-5m-1772315400",
+      "trades": 3,
+      "total_pnl_percent": -1.9207328493426439,
+      "wins": 1,
+      "losses": 2
+    },
+    {
+      "market_slug": "btc-updown-5m-1772315700",
+      "trades": 1,
+      "total_pnl_percent": -1.5964085250183195,
+      "wins": 1,
+      "losses": 0
+    }
+  ],
+  "total_trades": 18,
+  "completed_markets": 8,
+  "win_rate_pct": 27.77777777777778,
+  "avg_win_pct": 24.592969353434654,
+  "avg_loss_pct": -21.73889994376963,
+  "total_pnl_pct": -159.64085250183194,
+  "max_win_pct": 32.432432432432435,
+  "max_loss_pct": -51.38888888888889,
+  "starting_capital_usd": 4.0,
+  "ending_capital_usd": 2.4035914749816802,
+  "net_profit_usd": -1.5964085250183195,
+  "return_on_capital_pct": -39.910213125457986,
+  "signals_generated": 46,
+  "entries_taken": 18,
+  "entries_blocked_by_filter": 3,
+  "participation_rate_pct": 39.130434782608695
+}
