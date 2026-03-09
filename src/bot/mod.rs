@@ -1,4 +1,14 @@
+pub mod backtest;
 pub mod candles;
+pub mod discovery;
+pub mod execution;
+pub mod feed;
 pub mod indicators;
+pub mod logging;
+pub mod pipeline;
+pub mod monte_carlo;
+pub mod risk;
+pub mod shadow;
 pub mod signal;
+pub mod strategy_runner;
 pub mod validation;

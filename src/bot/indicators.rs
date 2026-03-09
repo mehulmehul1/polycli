@@ -3,17 +3,26 @@ use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IndicatorState {
+    pub ema3: Option<f64>,
+    pub ema6: Option<f64>,
     pub ema9: Option<f64>,
     pub ema21: Option<f64>,
     pub rsi14: Option<f64>,
     pub momentum_slope: Option<f64>,
+    pub bb_width: Option<f64>,
+    pub bb_percent: Option<f64>,
+    pub williams_r: Option<f64>,
 }
 
 pub struct IndicatorEngine {
+    ema3: Ema,
+    ema6: Ema,
     ema9: Ema,
     ema21: Ema,
     rsi14: Rsi,
     slope: MomentumSlope,
+    bb20: BollingerBands,
+    wr14: WilliamsR,
     last_candle_time: Option<u64>,
     prev_ema9: Option<f64>,
     prev_ema21: Option<f64>,
@@ -24,10 +33,14 @@ impl IndicatorEngine {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            ema3: Ema::new(3),
+            ema6: Ema::new(6),
             ema9: Ema::new(9),
             ema21: Ema::new(21),
             rsi14: Rsi::new(14),
             slope: MomentumSlope::new(14),
+            bb20: BollingerBands::new(20, 2.0),
+            wr14: WilliamsR::new(14),
             last_candle_time: None,
             prev_ema9: None,
             prev_ema21: None,
@@ -40,10 +53,14 @@ impl IndicatorEngine {
     }
 
     pub fn reset(&mut self) {
+        self.ema3 = Ema::new(3);
+        self.ema6 = Ema::new(6);
         self.ema9 = Ema::new(9);
         self.ema21 = Ema::new(21);
         self.rsi14 = Rsi::new(14);
         self.slope = MomentumSlope::new(14);
+        self.bb20 = BollingerBands::new(20, 2.0);
+        self.wr14 = WilliamsR::new(14);
         self.last_candle_time = None;
         self.prev_ema9 = None;
         self.prev_ema21 = None;
@@ -93,10 +110,14 @@ impl IndicatorEngine {
         self.prev_ema9 = self.ema9.value;
         self.prev_ema21 = self.ema21.value;
 
+        self.ema3.update(close);
+        self.ema6.update(close);
         self.ema9.update(close);
         self.ema21.update(close);
         self.rsi14.update(close);
         self.slope.update(close);
+        self.bb20.update(close);
+        self.wr14.update(candle);
 
         if self.has_invalid_state() { self.reset(); }
         self.get_state()
@@ -104,15 +125,20 @@ impl IndicatorEngine {
 
     fn has_invalid_state(&self) -> bool {
         let check = |v: Option<f64>| v.map_or(false, |f| !f.is_finite());
-        check(self.ema9.value) || check(self.ema21.value) || check(self.rsi14.value) || check(self.slope.value)
+        check(self.ema3.value) || check(self.ema6.value) || check(self.ema9.value) || check(self.ema21.value) || check(self.rsi14.value) || check(self.slope.value) || check(self.bb20.width) || check(self.bb20.percent) || check(self.wr14.value)
     }
 
     pub fn get_state(&self) -> IndicatorState {
         IndicatorState {
+            ema3: self.ema3.value,
+            ema6: self.ema6.value,
             ema9: self.ema9.value,
             ema21: self.ema21.value,
             rsi14: self.rsi14.value,
             momentum_slope: self.slope.value,
+            bb_width: self.bb20.width,
+            bb_percent: self.bb20.percent,
+            williams_r: self.wr14.value,
         }
     }
 }
@@ -251,6 +277,105 @@ impl MomentumSlope {
             self.value = Some(cov_xy / var_x);
         }
         self.value
+    }
+}
+
+pub struct BollingerBands {
+    period: usize,
+    multiplier: f64,
+    closes: VecDeque<f64>,
+    pub width: Option<f64>,
+    pub percent: Option<f64>,
+}
+
+impl BollingerBands {
+    pub fn new(period: usize, multiplier: f64) -> Self {
+        Self {
+            period,
+            multiplier,
+            closes: VecDeque::with_capacity(period),
+            width: None,
+            percent: None,
+        }
+    }
+
+    pub fn update(&mut self, close: f64) {
+        if self.closes.len() == self.period {
+            self.closes.pop_front();
+        }
+        self.closes.push_back(close);
+
+        let n = self.closes.len() as f64;
+        if n < 2.0 {
+            self.width = None;
+            self.percent = None;
+            return;
+        }
+
+        let mean = self.closes.iter().sum::<f64>() / n;
+        let variance = self.closes.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
+        let std_dev = variance.sqrt();
+
+        let lower = mean - (self.multiplier * std_dev);
+        let upper = mean + (self.multiplier * std_dev);
+
+        if mean == 0.0 {
+            self.width = None;
+        } else {
+            self.width = Some((upper - lower) / mean);
+        }
+
+        if upper == lower {
+             self.percent = Some(0.5); // completely flat
+        } else {
+             self.percent = Some((close - lower) / (upper - lower));
+        }
+    }
+}
+
+pub struct WilliamsR {
+    period: usize,
+    highs: VecDeque<f64>,
+    lows: VecDeque<f64>,
+    pub value: Option<f64>,
+}
+
+impl WilliamsR {
+    pub fn new(period: usize) -> Self {
+        Self {
+            period,
+            highs: VecDeque::with_capacity(period),
+            lows: VecDeque::with_capacity(period),
+            value: None,
+        }
+    }
+
+    pub fn update(&mut self, candle: &Candle) {
+        let (close, mut high, mut low) = (candle.close, candle.high, candle.low);
+
+        // Fallback or fix for missing high/low out of candle engine if necessary.
+        // Usually, the candle has them, but safety first:
+        if high == 0.0 { high = close; }
+        if low == 0.0 { low = close; }
+        if high < close { high = close; }
+        if low > close || low == 0.0 { low = close; }
+
+        if self.highs.len() == self.period {
+            self.highs.pop_front();
+            self.lows.pop_front();
+        }
+        self.highs.push_back(high);
+        self.lows.push_back(low);
+
+        let highest_high = self.highs.iter().cloned().fold(f64::MIN, f64::max);
+        let lowest_low = self.lows.iter().cloned().fold(f64::MAX, f64::min);
+
+        if highest_high == lowest_low {
+            self.value = Some(-50.0);
+        } else {
+            let r_value = ((highest_high - close) / (highest_high - lowest_low)) * -100.0;
+            self.value = Some(r_value);
+        }
     }
 }
 

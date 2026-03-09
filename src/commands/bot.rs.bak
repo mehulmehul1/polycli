@@ -1,0 +1,3335 @@
+use crate::auth;
+use crate::bot::backtest::{BacktestConfig, BacktestEngine, BeckerParser, PmxtFetcher};
+use crate::bot::backtest::data::load_mock_data;
+use crate::bot::backtest::metrics::ParameterSweepResult;
+use crate::bot::candles::CandleEngine;
+use crate::bot::discovery::{
+    self, CryptoAsset, DiscoveredMarket, GammaMarket, ListMarketsArgs, ListMarketsOutput,
+    MidpointRow, ParquetMarketStat, ResolvedSlugMarket, WatchedMarket,
+    BTC_UPDOWN_SLUG_PREFIX, BTC_UPDOWN_15M_SLUG_PREFIX, FIVE_MINUTES_SECONDS,
+    FIFTEEN_MINUTES_SECONDS,
+    discover_market_loop, discover_active_btc_market, discover_markets_for_input,
+    extract_hour_from_filename, fetch_btc_condition_ids, fetch_snapshot,
+    gamma_market_condition_id_hex, hour_btc_5m_slugs, is_btc_up_down_5m,
+    is_btc_updown_slug_or_question, is_updown_5m_text, load_parquet_market_stats,
+    load_parquet_market_stats_for_ids, market_matches_exact_filter, matches_crypto_text,
+    probe_btc_updown_slugs, resolve_btc_hour_slug_markets, run_list_markets,
+    btc_updown_label_from_question, candidate_slug_timestamps, has_binary_directional_tokens,
+    infer_market_window, is_active_now, market_label, market_to_watched, parse_slug_timestamp,
+    select_binary_tokens, window_overlaps_hour,
+};
+use crate::bot::feed::{
+    BookChangeSide, BookDeltaEvent, DualBookState, DualSnapshot, LiveFeedMode, MarketSnapshot,
+    MarketWebsocketFeed, OutcomeSide, ReplayMode,
+};
+use crate::bot::indicators::{IndicatorEngine, IndicatorState};
+use crate::bot::logging::JsonlEventLogger;
+use crate::bot::monte_carlo::{MonteCarloSimulator, SimulationConfig};
+use crate::bot::risk::{best_ask_price, best_bid_price, midpoint_price, FilterReason};
+use crate::bot::shadow::{ShadowExitRecord, ShadowPosition, ShadowStepResult, TokenSide};
+use crate::bot::signal::{SignalEngine, EntrySignal, ExitSignal};
+use crate::bot::strategy_runner::run_shadow_strategy_step;
+use crate::bot::validation::ValidationTracker;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Timelike, Utc};
+use clap::{Args, Subcommand, ValueEnum};
+use polymarket_client_sdk::auth::state::Authenticated;
+use polymarket_client_sdk::auth::Normal;
+use polymarket_client_sdk::clob;
+use polymarket_client_sdk::clob::types::request::{MidpointRequest, OrderBookSummaryRequest, PriceRequest, BalanceAllowanceRequest};
+use polymarket_client_sdk::clob::types::response::MarketResponse;
+use polymarket_client_sdk::clob::types::{Side, OrderType, AssetType, Amount};
+use polymarket_client_sdk::gamma;
+use polymarket_client_sdk::gamma::types::request::{
+    MarketBySlugRequest, MarketsRequest, SearchRequest,
+};
+use polymarket_client_sdk::gamma::types::response::Market;
+use polymarket_client_sdk::types::{Decimal, U256};
+use serde::{Deserialize, Serialize};
+use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
+
+#[derive(Args)]
+pub struct BotArgs {
+    #[command(subcommand)]
+    pub command: BotCommand,
+}
+
+#[derive(Subcommand)]
+pub enum BotCommand {
+    /// Watch the active 5-minute BTC "Up or Down" market and print live orderbook stats
+    WatchBtc(LiveShadowArgs),
+    /// Automated 20-market validation run with metrics export
+    ValidateBtc(LiveShadowArgs),
+    /// LIVE TRADING: Same strategy as watch-btc but places real market orders
+    TradeBtc(TradeBtcArgs),
+    /// LIVE TRADING: 15-minute BTC markets - same strategy as 5m
+    TradeBtc15m(TradeBtcArgs),
+    /// Run historical backtest with Becker dataset or mock data
+    Backtest(BacktestArgs),
+    /// Run Monte Carlo simulation on backtest results
+    MonteCarlo(MonteCarloArgs),
+    /// Run parameter sweep across entry bands
+    Sweep(SweepArgs),
+    /// Fetch filtered BTC Up/Down data from remote PMXT Parquet archive
+    FetchPmxt(FetchPmxtArgs),
+    /// Extract BTC midpoints from local Parquet using Gamma API for ID mapping
+    ExtractMidpoints(ExtractMidpointsArgs),
+    /// Inspect Parquet file schema and sample data
+    InspectParquet(InspectParquetArgs),
+    /// List sequential BTC up/down markets from Parquet with 5-min window alignment
+    ListMarkets(ListMarketsArgs),
+    /// Stream historical orderbook data from PMXT and run shadow backtest
+    BacktestPipeline(BacktestPipelineArgs),
+}
+
+#[derive(Args, Clone)]
+pub struct LiveShadowArgs {
+    /// Live feed mode for shadow validation
+    #[arg(long, value_enum, default_value_t = LiveFeedMode::Websocket)]
+    pub feed: LiveFeedMode,
+
+    /// Optional JSONL event log path
+    #[arg(long)]
+    pub event_log: Option<String>,
+}
+
+
+
+#[derive(Args)]
+pub struct BacktestPipelineArgs {
+    /// Optional local or remote parquet file to process directly
+    #[arg(long)]
+    pub input: Option<String>,
+
+    /// Start time (ISO format: 2026-03-02T00:00:00Z)
+    #[arg(long)]
+    pub start: String,
+
+    /// End time (ISO format: 2026-03-03T00:00:00Z)
+    #[arg(long)]
+    pub end: String,
+
+    /// Market filter pattern (default: btc-updown-5m)
+    #[arg(long, default_value = "btc-updown-5m")]
+    pub filter: String,
+
+    /// Use top N markets by tick count (skips Gamma API probing)
+    #[arg(long)]
+    pub top_n: Option<usize>,
+
+    /// Minimum parquet ticks required before metadata lookup
+    #[arg(long, default_value = "1")]
+    pub min_ticks: usize,
+
+    /// Crypto filter for exact market matching
+    #[arg(long, value_enum, default_value_t = CryptoAsset::Btc)]
+    pub crypto: CryptoAsset,
+
+    /// Starting capital in USD
+    #[arg(long, default_value = "100")]
+    pub capital: f64,
+
+    /// Position size in USD
+    #[arg(long, default_value = "1")]
+    pub size: f64,
+
+    /// Entry band low
+    #[arg(long, default_value = "0.35")]
+    pub band_low: f64,
+
+    /// Entry band high
+    #[arg(long, default_value = "0.65")]
+    pub band_high: f64,
+
+    /// Export results to JSON
+    #[arg(long)]
+    pub export: Option<String>,
+
+    /// Export tick data to CSV
+    #[arg(long)]
+    pub export_ticks: Option<String>,
+
+    /// Replay mode for historical orderbook processing
+    #[arg(long, value_enum, default_value_t = ReplayMode::Event)]
+    pub replay_mode: ReplayMode,
+
+    /// Optional JSONL event log path
+    #[arg(long)]
+    pub event_log: Option<String>,
+
+    /// Show verbose output
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
+#[derive(Args)]
+pub struct InspectParquetArgs {
+    /// Path to local Parquet file
+    #[arg(short, long)]
+    pub input: String,
+
+    /// Show sample rows (default: 10)
+    #[arg(long, default_value = "10")]
+    pub sample: usize,
+
+    /// Filter by market_id (condition ID)
+    #[arg(long)]
+    pub market_id: Option<String>,
+
+    /// Filter by token_id embedded in the data JSON payload
+    #[arg(long, conflicts_with = "market_id")]
+    pub token_id: Option<String>,
+}
+
+#[derive(Args)]
+pub struct TradeBtcArgs {
+    /// Position size in USDC per trade
+    #[arg(long, default_value = "1.0")]
+    pub size: f64,
+
+    /// Dry run mode - show signals but don't place orders
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args)]
+pub struct BacktestArgs {
+    /// Path to Becker dataset (parquet or CSV). If not provided, uses mock data.
+    #[arg(short, long)]
+    pub data: Option<String>,
+
+    /// Entry band low (default: 0.35)
+    #[arg(long, default_value = "0.35")]
+    pub band_low: f64,
+
+    /// Entry band high (default: 0.65)
+    #[arg(long, default_value = "0.65")]
+    pub band_high: f64,
+
+    /// Starting capital in USD
+    #[arg(long, default_value = "100")]
+    pub capital: f64,
+
+    /// Position size in USD
+    #[arg(long, default_value = "1")]
+    pub size: f64,
+
+    /// Export results to JSON file
+    #[arg(long)]
+    pub export: Option<String>,
+}
+
+#[derive(Args)]
+pub struct MonteCarloArgs {
+    /// Number of simulations to run
+    #[arg(short = 'n', long, default_value = "10000")]
+    pub simulations: usize,
+
+    /// Number of trades per simulation
+    #[arg(long, default_value = "500")]
+    pub trades: usize,
+
+    /// Position size as fraction of capital (e.g., 0.02 = 2%)
+    #[arg(long, default_value = "0.02")]
+    pub kelly: f64,
+
+    /// Seed for reproducibility
+    #[arg(long)]
+    pub seed: Option<u64>,
+
+    /// Import backtest results from JSON file
+    #[arg(short, long)]
+    pub input: Option<String>,
+
+    /// Export results to JSON file
+    #[arg(long)]
+    pub export: Option<String>,
+}
+
+#[derive(Args)]
+pub struct SweepArgs {
+    /// Path to Becker dataset (optional, uses mock data if not provided)
+    #[arg(short, long)]
+    pub data: Option<String>,
+
+    /// Export results to JSON file
+    #[arg(long)]
+    pub export: Option<String>,
+}
+
+#[derive(Args)]
+pub struct FetchPmxtArgs {
+    /// URL of the remote PMXT Parquet file
+    #[arg(short, long)]
+    pub url: String,
+
+    /// Filter pattern for market slug (default: btc-updown-5m)
+    #[arg(short, long, default_value = "btc-updown-5m")]
+    pub filter: String,
+
+    /// Export filtered data to CSV file
+    #[arg(long)]
+    pub csv: Option<String>,
+
+    /// Export filtered data to Parquet file
+    #[arg(long)]
+    pub parquet: Option<String>,
+
+    /// Run backtest on fetched data immediately
+    #[arg(short, long)]
+    pub backtest: bool,
+}
+
+#[derive(Args)]
+pub struct ExtractMidpointsArgs {
+    /// Path to local Parquet file (orderbook data)
+    #[arg(short, long)]
+    pub input: String,
+
+    /// Filter pattern for market slug (default: btc-updown-5m)
+    #[arg(short, long, default_value = "btc-updown-5m")]
+    pub filter: String,
+
+    /// Export to CSV file
+    #[arg(long)]
+    pub csv: Option<String>,
+
+    /// Only fetch condition IDs from Gamma API (dry run)
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+
+
+struct PendingSettlement {
+    market_slug: String,
+    token_side: TokenSide,
+    token_id: U256,
+    shares: f64,
+    entry_price: f64,
+    condition_id: Option<String>,
+    end_time: DateTime<Utc>,
+    sell_attempts: u32,
+    created_at: DateTime<Utc>,
+}
+
+pub async fn execute(args: BotArgs) -> Result<()> {
+    match args.command {
+        BotCommand::WatchBtc(live_args) => watch_btc_market(None, live_args).await,
+        BotCommand::ValidateBtc(live_args) => watch_btc_market(Some(20), live_args).await,
+        BotCommand::TradeBtc(trade_args) => trade_btc_live(trade_args).await,
+        BotCommand::TradeBtc15m(trade_args) => trade_btc_live(trade_args).await,
+        BotCommand::Backtest(backtest_args) => run_backtest(backtest_args).await,
+        BotCommand::MonteCarlo(mc_args) => run_monte_carlo(mc_args),
+        BotCommand::Sweep(sweep_args) => run_parameter_sweep(sweep_args),
+        BotCommand::FetchPmxt(pmxt_args) => run_fetch_pmxt(pmxt_args).await,
+        BotCommand::ExtractMidpoints(extract_args) => run_extract_midpoints(extract_args).await,
+        BotCommand::InspectParquet(inspect_args) => run_inspect_parquet(inspect_args),
+        BotCommand::ListMarkets(list_args) => run_list_markets(list_args).await,
+        BotCommand::BacktestPipeline(pipeline_args) => run_backtest_pipeline(pipeline_args).await,
+    }
+}
+
+async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs) -> Result<()> {
+    let gamma_client = gamma::Client::default();
+    let clob_client = clob::Client::default();
+    let event_logger = live_args
+        .event_log
+        .as_deref()
+        .map(JsonlEventLogger::new)
+        .transpose()
+        .context("Failed to create live event log")?;
+
+    let mut watched = discover_market_loop(&gamma_client).await;
+    let mut websocket_feed = if live_args.feed == LiveFeedMode::Websocket {
+        Some(
+            MarketWebsocketFeed::connect(
+                watched.condition_id.clone(),
+                watched.yes_token_id,
+                watched.no_token_id,
+                event_logger.clone(),
+            )
+            .await
+            .context("Failed to connect Polymarket market websocket")?,
+        )
+    } else {
+        None
+    };
+    let mut live_book_state = DualBookState::default();
+
+    let mut validator = max_markets.map(ValidationTracker::new);
+
+    let mut ind_1m = IndicatorEngine::new();
+    let mut ind_5s = IndicatorEngine::new();
+    let mut signal_engine = SignalEngine::new();
+
+    let mut candle_engine = CandleEngine::new();
+    candle_engine.set_debug(false);
+
+    let mut shadow = ShadowPosition::default();
+
+    let mut state_1m = IndicatorState::default();
+    let mut state_5s = IndicatorState::default();
+
+    let mut last_yes_bid = 0.0;
+    let mut last_no_bid = 0.0;
+    let mut current_slug = watched.slug.clone();
+
+    let mut ticker = interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    println!("[SHADOW MODE] Probability Expansion Scalper");
+    println!("[SHADOW MODE] Entry: slope > 0.002 + breakout | Exit: slope flip");
+    println!("[SHADOW MODE] Range: 0.35 - 0.65 | Spread: < 10% of ask");
+    println!("[SHADOW MODE] Feed: {:?}", live_args.feed);
+    println!("========================================");
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\n[SHADOW] Final PnL: {:.4}%", shadow.realized_pnl * 100.0);
+                if let Some(v) = &validator {
+                    v.print_summary();
+                }
+                println!("Received Ctrl+C, stopping bot watch.");
+                break;
+            }
+            _ = ticker.tick() => {
+                if Utc::now() >= watched.end_time || watched.slug != current_slug {
+                    if shadow.is_active() {
+                        let price = match shadow.token_side {
+                            Some(TokenSide::Yes) => last_yes_bid,
+                            Some(TokenSide::No) => last_no_bid,
+                            None => shadow.entry_price,
+                        };
+
+                        let settlement_price = if price > 0.5 { 1.0 } else { 0.0 };
+                        let final_pnl = shadow.pnl(settlement_price);
+                        shadow.realized_pnl += final_pnl * shadow.size;
+                        shadow.position_realized_pnl += final_pnl * shadow.size;
+
+                        let dollar_pnl = final_pnl * shadow.position_size_usd;
+                        shadow.bankroll_usd += shadow.position_size_usd + dollar_pnl;
+                        shadow.realized_usd += dollar_pnl;
+                        shadow.position_realized_usd += dollar_pnl;
+
+                        if let Some(v) = &mut validator {
+                            let duration = (Utc::now().timestamp() as u64 - shadow.entry_timestamp) as i64;
+                            let side_str = match shadow.token_side {
+                                Some(TokenSide::Yes) => "YES".to_string(),
+                                Some(TokenSide::No) => "NO".to_string(),
+                                None => "N/A".to_string(),
+                            };
+                            v.record_trade(
+                                watched.slug.clone(),
+                                side_str,
+                                shadow.entry_price,
+                                settlement_price,
+                                shadow.position_realized_pnl,
+                                duration,
+                                shadow.position_realized_usd,
+                                shadow.bankroll_usd,
+                            );
+                        }
+
+                        let side_name = match shadow.token_side {
+                            Some(TokenSide::Yes) => "YES",
+                            Some(TokenSide::No) => "NO",
+                            None => "N/A",
+                        };
+                        println!(
+                            "[SETTLEMENT] {} | {} @ {:.2} -> {:.2} | {:.4}% | Bankroll: ${:.2}",
+                            side_name,
+                            watched.slug,
+                            shadow.entry_price,
+                            settlement_price,
+                            shadow.position_realized_pnl * 100.0,
+                            shadow.bankroll_usd
+                        );
+                    }
+
+                    if let Some(v) = &mut validator {
+                        v.finalize_market(watched.slug.clone(), shadow.realized_pnl);
+                        if v.completed_markets >= v.max_markets {
+                            v.print_summary();
+                            return Ok(());
+                        }
+                    }
+
+                    println!(
+                        "Market {} reached resolution time. Looking for next active BTC 5m market...",
+                        watched.slug
+                    );
+                    watched = discover_market_loop(&gamma_client).await;
+                    current_slug = watched.slug.clone();
+                    live_book_state = DualBookState::default();
+
+                    if let Some(feed) = websocket_feed.take() {
+                        feed.shutdown().await;
+                    }
+                    if live_args.feed == LiveFeedMode::Websocket {
+                        websocket_feed = Some(
+                            MarketWebsocketFeed::connect(
+                                watched.condition_id.clone(),
+                                watched.yes_token_id,
+                                watched.no_token_id,
+                                event_logger.clone(),
+                            )
+                            .await
+                            .context("Failed to reconnect Polymarket market websocket")?,
+                        );
+                    }
+
+                    signal_engine.reset();
+                    ind_1m.reset();
+                    ind_5s.reset();
+                    shadow.full_reset();
+                    state_1m = IndicatorState::default();
+                    state_5s = IndicatorState::default();
+                    last_yes_bid = 0.0;
+                    last_no_bid = 0.0;
+
+                    println!("[MARKET RESET] All engines cleared | {}", watched.slug);
+                    println!("========================================");
+                }
+
+                let dual_snapshot = match live_args.feed {
+                    LiveFeedMode::Poll => {
+                        let yes_snapshot = match fetch_snapshot(&clob_client, watched.yes_token_id).await {
+                            Ok(s) => s,
+                            Err(err) => {
+                                eprintln!("[warn] Failed to fetch YES market data: {err:#}");
+                                continue;
+                            }
+                        };
+                        let no_snapshot = match fetch_snapshot(&clob_client, watched.no_token_id).await {
+                            Ok(s) => s,
+                            Err(err) => {
+                                eprintln!("[warn] Failed to fetch NO market data: {err:#}");
+                                continue;
+                            }
+                        };
+                        DualSnapshot {
+                            yes: yes_snapshot,
+                            no: no_snapshot,
+                            ts_exchange: Utc::now().timestamp_millis() as f64 / 1000.0,
+                        }
+                    }
+                    LiveFeedMode::Websocket => {
+                        let Some(feed) = websocket_feed.as_mut() else {
+                            continue;
+                        };
+                        while let Some(event) = feed.try_recv() {
+                            live_book_state.apply(&event);
+                        }
+                        let Some(snapshot) = live_book_state.snapshot() else {
+                            continue;
+                        };
+                        snapshot
+                    }
+                };
+
+                if let Some(midpoint) = midpoint_price(&dual_snapshot.yes) {
+                    last_yes_bid = best_bid_price(&dual_snapshot.yes).unwrap_or(last_yes_bid);
+                    last_no_bid = best_bid_price(&dual_snapshot.no).unwrap_or(last_no_bid);
+                    let epoch_seconds = dual_snapshot.ts_exchange.floor() as u64;
+
+                    if let Some(logger) = &event_logger {
+                        logger.log("normalized_snapshots", &dual_snapshot);
+                    }
+
+                    if epoch_seconds % 10 == 0 {
+                        let yes_bid = best_bid_price(&dual_snapshot.yes).unwrap_or(0.0);
+                        let yes_ask = best_ask_price(&dual_snapshot.yes).unwrap_or(0.0);
+                        let no_bid = best_bid_price(&dual_snapshot.no).unwrap_or(0.0);
+                        let no_ask = best_ask_price(&dual_snapshot.no).unwrap_or(0.0);
+                        let yes_spread = yes_ask - yes_bid;
+                        let no_spread = no_ask - no_bid;
+                        let yes_max = yes_ask * 0.10;
+                        let no_max = no_ask * 0.10;
+                        println!("[BOOK] YES: bid={:.4} ask={:.4} spread={:.4} max={:.4} | NO: bid={:.4} ask={:.4} spread={:.4} max={:.4} | mid={:.4}",
+                            yes_bid, yes_ask, yes_spread, yes_max, no_bid, no_ask, no_spread, no_max, midpoint);
+                    }
+
+                    if let Some(step) = run_shadow_strategy_step(
+                        &dual_snapshot,
+                        &watched.label,
+                        &watched.slug,
+                        watched.end_time.timestamp() - FIVE_MINUTES_SECONDS,
+                        watched.end_time.timestamp(),
+                        epoch_seconds,
+                        1.0,
+                        &mut candle_engine,
+                        &mut ind_1m,
+                        &mut ind_5s,
+                        &mut signal_engine,
+                        &mut state_1m,
+                        &mut state_5s,
+                        &mut shadow,
+                    ) {
+                        if step.signal_seen {
+                            if let Some(v) = &mut validator {
+                                v.record_signal();
+                            }
+                        }
+                        if step.entry_blocked {
+                            if let Some(v) = &mut validator {
+                                v.record_entry_blocked();
+                            }
+                        }
+                        if step.entry_taken {
+                            if let Some(v) = &mut validator {
+                                v.record_entry_taken();
+                            }
+                        }
+                        if let Some(logger) = &event_logger {
+                            logger.log("strategy_steps", &step);
+                        }
+                        if let Some(exit_trade) = step.exit_trade {
+                            if let Some(v) = &mut validator {
+                                v.record_trade(
+                                    watched.slug.clone(),
+                                    exit_trade.side,
+                                    exit_trade.entry_price,
+                                    exit_trade.exit_price,
+                                    exit_trade.pnl_pct,
+                                    exit_trade.duration,
+                                    exit_trade.pnl_usd,
+                                    exit_trade.bankroll_after,
+                                );
+                            }
+                        }
+                    }
+
+                    if shadow.is_active() {
+                        let exit_price = match shadow.token_side {
+                            Some(TokenSide::Yes) => best_bid_price(&dual_snapshot.yes).unwrap_or(0.0),
+                            Some(TokenSide::No) => best_bid_price(&dual_snapshot.no).unwrap_or(0.0),
+                            _ => 0.0,
+                        };
+
+                        let unrealized = shadow.pnl(exit_price) * shadow.size;
+                        let total = shadow.realized_pnl + unrealized;
+                        if epoch_seconds % 30 == 0 {
+                            let yes_bid = best_bid_price(&dual_snapshot.yes).unwrap_or(0.0);
+                            let yes_ask = best_ask_price(&dual_snapshot.yes).unwrap_or(0.0);
+                            let no_bid = best_bid_price(&dual_snapshot.no).unwrap_or(0.0);
+                            let no_ask = best_ask_price(&dual_snapshot.no).unwrap_or(0.0);
+
+                            println!(
+                                "[BOOK] YES {:.4}/{:.4} | NO {:.4}/{:.4} | sum={:.4}",
+                                yes_bid, yes_ask, no_bid, no_ask, yes_ask + no_ask
+                            );
+                            println!(
+                                "[TICK] {:?} entry={:.4} current={:.4} | PnL: {:.4}% | Total: {:.4}%",
+                                shadow.token_side.unwrap(), shadow.entry_price, exit_price, unrealized * 100.0, total * 100.0
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(feed) = websocket_feed {
+        feed.shutdown().await;
+    }
+
+    Ok(())
+}
+
+struct LivePosition {
+    token_side: Option<TokenSide>,
+    entry_price: f64,
+    shares: f64,
+    entry_timestamp: u64,
+    last_exit_timestamp: u64,
+    yes_blocked: bool,
+    no_blocked: bool,
+    last_trade_id: Option<String>,
+}
+
+impl Default for LivePosition {
+    fn default() -> Self {
+        Self {
+            token_side: None,
+            entry_price: 0.0,
+            shares: 0.0,
+            entry_timestamp: 0,
+            last_exit_timestamp: 0,
+            yes_blocked: false,
+            no_blocked: false,
+            last_trade_id: None,
+        }
+    }
+}
+
+impl LivePosition {
+    fn is_active(&self) -> bool {
+        self.token_side.is_some()
+    }
+
+    fn reset(&mut self, timestamp: u64, was_loss: bool) {
+        if was_loss {
+            match self.token_side {
+                Some(TokenSide::Yes) => self.yes_blocked = true,
+                Some(TokenSide::No) => self.no_blocked = true,
+                None => {}
+            }
+        }
+        self.token_side = None;
+        self.entry_price = 0.0;
+        self.shares = 0.0;
+        self.entry_timestamp = 0;
+        self.last_trade_id = None;
+        self.last_exit_timestamp = timestamp;
+    }
+
+    fn full_reset(&mut self) {
+        self.token_side = None;
+        self.entry_price = 0.0;
+        self.shares = 0.0;
+        self.entry_timestamp = 0;
+        self.last_exit_timestamp = 0;
+        self.last_trade_id = None;
+        self.yes_blocked = false;
+        self.no_blocked = false;
+    }
+}
+
+async fn trade_btc_live(args: TradeBtcArgs) -> Result<()> {
+    let signer = auth::resolve_signer(None)?;
+    let clob_client = auth::authenticate_with_signer(&signer, None).await?;
+    let gamma_client = gamma::Client::default();
+    let read_client = clob::Client::default();
+
+    let balance = get_usdc_balance(&clob_client).await?;
+    println!("[LIVE] USDC Balance: ${:.2}", balance);
+    
+    if balance < args.size {
+        anyhow::bail!("Insufficient USDC balance: ${:.2} < ${:.2}", balance, args.size);
+    }
+
+    let mut watched = discover_market_loop(&gamma_client).await;
+
+    let mut ind_1m = IndicatorEngine::new();
+    let mut ind_5s = IndicatorEngine::new();
+    let mut signal_engine = SignalEngine::new();
+    let mut candle_engine = CandleEngine::new();
+    candle_engine.set_debug(false);
+
+    let mut position = LivePosition::default();
+    let mut state_1m = IndicatorState::default();
+    let mut state_5s = IndicatorState::default();
+
+    let mut last_midpoint = None;
+    let mut current_slug = watched.slug.clone();
+
+    let mut pending_settlements: Vec<PendingSettlement> = Vec::new();
+
+    let mut ticker = interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    if args.dry_run {
+        println!("[LIVE *** DRY RUN ***] No orders will be placed");
+    }
+    println!("[LIVE] Probability Expansion Scalper");
+    println!("[LIVE] Entry: slope > 0.002 + breakout | Exit: slope flip");
+    println!("[LIVE] Range: 0.35 - 0.65 | Size: ${:.2}", args.size);
+    println!("[LIVE] Auto-sell enabled for pending positions");
+    println!("========================================");
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\n[LIVE] Stopping bot...");
+                if position.is_active() {
+                    println!("[LIVE] WARNING: Position still open! Manual exit required.");
+                }
+                if !pending_settlements.is_empty() {
+                    println!("[LIVE] WARNING: {} pending settlements require manual resolution!", pending_settlements.len());
+                    for p in &pending_settlements {
+                        println!("  - {} | {:?} | {} shares", p.market_slug, p.token_side, p.shares);
+                    }
+                }
+                break;
+            }
+            _ = ticker.tick() => {
+                let now = Utc::now();
+
+                // Try to settle pending positions
+                if !pending_settlements.is_empty() && !args.dry_run {
+                    try_settle_pending(
+                        &mut pending_settlements,
+                        &read_client,
+                        &clob_client,
+                        &signer,
+                        now,
+                    ).await;
+                }
+
+                // Check if current market ended
+                if now >= watched.end_time || watched.slug != current_slug {
+                    // Move active position to pending settlements
+                    if position.is_active() {
+                        let (token_id, token_side) = match position.token_side {
+                            Some(TokenSide::Yes) => (watched.yes_token_id, TokenSide::Yes),
+                            Some(TokenSide::No) => (watched.no_token_id, TokenSide::No),
+                            None => {
+                                position.full_reset();
+                                return Ok(());
+                            }
+                        };
+
+                        let pending = PendingSettlement {
+                            market_slug: watched.slug.clone(),
+                            token_side,
+                            token_id,
+                            shares: position.shares,
+                            entry_price: position.entry_price,
+                            condition_id: watched.condition_id.clone(),
+                            end_time: watched.end_time,
+                            sell_attempts: 0,
+                            created_at: now,
+                        };
+
+                        println!(
+                            "[PENDING] {} | {:?} | {:.4} shares @ {:.4} | Auto-sell queued",
+                            pending.market_slug, pending.token_side, pending.shares, pending.entry_price
+                        );
+
+                        pending_settlements.push(pending);
+                    }
+
+                    // Always full reset position when market ends (clears directional locks)
+                    position.full_reset();
+
+                    println!("[LIVE] Market {} ended. Looking for next market...", watched.slug);
+                    watched = discover_market_loop(&gamma_client).await;
+                    current_slug = watched.slug.clone();
+
+                    signal_engine.reset();
+                    ind_1m.reset();
+                    ind_5s.reset();
+                    state_1m = IndicatorState::default();
+                    state_5s = IndicatorState::default();
+                    last_midpoint = None;
+
+                    println!("[MARKET RESET] All engines cleared | {}", watched.slug);
+                    if !pending_settlements.is_empty() {
+                        println!("[PENDING] {} positions awaiting settlement", pending_settlements.len());
+                    }
+                    println!("========================================");
+                    continue;
+                }
+
+                let yes_snapshot = match fetch_snapshot(&read_client, watched.yes_token_id).await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        eprintln!("[warn] Failed to fetch YES market data: {err:#}");
+                        continue;
+                    }
+                };
+                let no_snapshot = match fetch_snapshot(&read_client, watched.no_token_id).await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        eprintln!("[warn] Failed to fetch NO market data: {err:#}");
+                        continue;
+                    }
+                };
+
+                let dual_snapshot = DualSnapshot {
+                    yes: yes_snapshot,
+                    no: no_snapshot,
+                };
+
+                if let Some(midpoint) = midpoint_price(&dual_snapshot.yes) {
+                    last_midpoint = Some(midpoint);
+                    let spread_f64 = dual_snapshot.yes.spread.map(decimal_to_f64).unwrap_or(0.0);
+                    let simulated_volume = decimal_to_f64(dual_snapshot.yes.top5_bid_depth + dual_snapshot.yes.top5_ask_depth);
+                    let epoch_seconds = now.timestamp() as u64;
+
+                    if epoch_seconds % 10 == 0 {
+                        let yes_bid = best_bid_price(&dual_snapshot.yes).unwrap_or(0.0);
+                        let yes_ask = best_ask_price(&dual_snapshot.yes).unwrap_or(0.0);
+                        let no_bid = best_bid_price(&dual_snapshot.no).unwrap_or(0.0);
+                        let no_ask = best_ask_price(&dual_snapshot.no).unwrap_or(0.0);
+                        println!("[BOOK] YES: {:.4}/{:.4} | NO: {:.4}/{:.4} | mid={:.4}", 
+                            yes_bid, yes_ask, no_bid, no_ask, midpoint);
+                    }
+
+                    let closed_candles = candle_engine.update(midpoint, spread_f64, simulated_volume, epoch_seconds);
+
+                    if let Some(closed) = closed_candles {
+                        if let Some(c) = closed.one_minute {
+                            state_1m = ind_1m.update(&c);
+                        }
+
+                        if let Some(c) = closed.five_second {
+                            state_5s = ind_5s.update(&c);
+
+                            let signal = signal_engine.update(&state_5s, &state_1m, midpoint);
+
+                            handle_live_signals(
+                                &signal,
+                                &dual_snapshot,
+                                &mut position,
+                                &watched,
+                                epoch_seconds,
+                                args.size,
+                                args.dry_run,
+                                &clob_client,
+                                &signer,
+                            ).await;
+                        }
+                    }
+
+                    if position.is_active() {
+                        let exit_price = match position.token_side {
+                            Some(TokenSide::Yes) => best_bid_price(&dual_snapshot.yes).unwrap_or(0.0),
+                            Some(TokenSide::No) => best_bid_price(&dual_snapshot.no).unwrap_or(0.0),
+                            _ => 0.0,
+                        };
+                        
+                        if exit_price > 0.0 && epoch_seconds % 30 == 0 {
+                            let pnl_pct = (exit_price - position.entry_price) / position.entry_price * 100.0;
+                            let pnl_usd = pnl_pct / 100.0 * args.size;
+                            println!(
+                                "[POSITION] {:?} entry={:.4} current={:.4} | PnL: {:.2}% (${:.2})",
+                                position.token_side.unwrap(), position.entry_price, exit_price, pnl_pct, pnl_usd
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn try_settle_pending(
+    pending: &mut Vec<PendingSettlement>,
+    read_client: &clob::Client,
+    clob_client: &clob::Client<Authenticated<Normal>>,
+    signer: &(impl polymarket_client_sdk::auth::Signer + Sync),
+    now: DateTime<Utc>,
+) {
+    let mut settled = Vec::new();
+
+    for i in 0..pending.len() {
+        let p = &mut pending[i];
+        
+        // Only try to sell every 5 seconds
+        if p.sell_attempts > 0 && (now - p.created_at).num_seconds() % 5 != 0 {
+            continue;
+        }
+
+        p.sell_attempts += 1;
+
+        // Fetch current bid for the token
+        let snapshot = match fetch_snapshot(read_client, p.token_id).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let bid_price = match snapshot.best_bid.map(decimal_to_f64) {
+            Some(price) if price > 0.0 => price,
+            _ => {
+                // No liquidity yet
+                if p.sell_attempts % 10 == 0 {
+                    println!("[PENDING] {} | {:?} | No bid after {} attempts", 
+                        p.market_slug, p.token_side, p.sell_attempts);
+                }
+                continue;
+            }
+        };
+
+        // If bid is >= 0.95, try to sell (winning token post-resolution)
+        // Or if bid is reasonable and we've waited > 60s
+        let elapsed = (now - p.created_at).num_seconds();
+        let should_sell = bid_price >= 0.95 || (bid_price >= 0.90 && elapsed > 60) || (bid_price > 0.0 && elapsed > 120);
+
+        if !should_sell {
+            if p.sell_attempts % 10 == 0 {
+                println!("[PENDING] {} | {:?} | Bid {:.4} too low, waiting...", 
+                    p.market_slug, p.token_side, bid_price);
+            }
+            continue;
+        }
+
+        // Query ACTUAL token balance (don't trust tracked shares)
+        let balance_request = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Conditional)
+            .token_id(p.token_id)
+            .build();
+        
+        let actual_balance = match clob_client.balance_allowance(balance_request).await {
+            Ok(b) => {
+                // Balance is in raw units (micro-shares), divide by 10^6
+                const DECIMALS: u32 = 6;
+                let divisor = Decimal::from(10u64.pow(DECIMALS));
+                let human_balance = b.balance / divisor;
+                decimal_to_f64(human_balance)
+            }
+            Err(err) => {
+                eprintln!("[AUTO-SELL] {} | Failed to fetch balance: {:?}", p.market_slug, err);
+                continue;
+            }
+        };
+
+        // Round DOWN to 2 decimals
+        let shares_to_sell = (actual_balance * 100.0).floor() / 100.0;
+        
+        if shares_to_sell < 0.01 {
+            println!("[SETTLED] {} | {:?} | No shares left (balance: {:.6})", 
+                p.market_slug, p.token_side, actual_balance);
+            settled.push(i);
+            continue;
+        }
+
+        let side_name = match p.token_side {
+            TokenSide::Yes => "YES",
+            TokenSide::No => "NO",
+        };
+
+        println!(
+            "[AUTO-SELL] {} | {:?} | {:.4} shares @ {:.4} (actual: {:.6})",
+            p.market_slug, p.token_side, shares_to_sell, bid_price, actual_balance
+        );
+
+        match place_market_sell(clob_client, signer, p.token_id, shares_to_sell).await {
+            Ok(result) => {
+                let pnl_pct = (bid_price - p.entry_price) / p.entry_price * 100.0;
+                let pnl_usd = pnl_pct / 100.0 * (shares_to_sell * p.entry_price);
+                println!(
+                    "[SETTLED] {} | {} | {:.2}% | ${:.2} | Order: {}",
+                    p.market_slug, side_name, pnl_pct, pnl_usd, result.order_id
+                );
+                settled.push(i);
+            }
+            Err(err) => {
+                eprintln!("[AUTO-SELL FAILED] {} | {:?} | {:?}", p.market_slug, p.token_side, err);
+            }
+        }
+    }
+
+    // Remove settled positions (in reverse order to maintain indices)
+    for i in settled.into_iter().rev() {
+        pending.remove(i);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_live_signals(
+    signal: &crate::bot::signal::SignalState,
+    dual_snapshot: &DualSnapshot,
+    position: &mut LivePosition,
+    market: &WatchedMarket,
+    timestamp: u64,
+    size_usd: f64,
+    dry_run: bool,
+    clob_client: &clob::Client<Authenticated<Normal>>,
+    signer: &(impl polymarket_client_sdk::auth::Signer + Sync),
+) {
+    let time_remaining = (market.end_time.timestamp() - Utc::now().timestamp()).max(0);
+
+    if signal.entry != EntrySignal::None && !position.is_active() {
+        if time_remaining < 30 || time_remaining > 280 {
+            return;
+        }
+
+        if timestamp - position.last_exit_timestamp < 15 {
+            return;
+        }
+
+        match signal.entry {
+            EntrySignal::Long if position.yes_blocked => {
+                println!("[BLOCKED] YES direction locked after loss");
+                return;
+            }
+            EntrySignal::Short if position.no_blocked => {
+                println!("[BLOCKED] NO direction locked after loss");
+                return;
+            }
+            _ => {}
+        }
+
+        let (token_id, token_side, snapshot_side) = match signal.entry {
+            EntrySignal::Long => (market.yes_token_id, TokenSide::Yes, &dual_snapshot.yes),
+            EntrySignal::Short => (market.no_token_id, TokenSide::No, &dual_snapshot.no),
+            EntrySignal::None => return,
+        };
+
+        let yes_ask = best_ask_price(&dual_snapshot.yes).unwrap_or(0.0);
+        let no_ask = best_ask_price(&dual_snapshot.no).unwrap_or(0.0);
+
+        let contract_age = (timestamp as i64) - (market.end_time.timestamp() - FIVE_MINUTES_SECONDS);
+
+        if let Err(reason) = trade_allowed(snapshot_side, time_remaining, contract_age, yes_ask, no_ask) {
+            println!("[FILTER BLOCKED] {:?} | Reason: {:?}", token_side, reason);
+            return;
+        }
+
+        let entry_price = best_ask_price(snapshot_side).unwrap_or(0.0);
+        if entry_price < 0.0001 {
+            println!("[NO LIQUIDITY] No ask price for {:?}", token_side);
+            return;
+        }
+
+        let side_name = match token_side {
+            TokenSide::Yes => "YES",
+            TokenSide::No => "NO",
+        };
+
+        println!(
+            "[SIGNAL] {} | BUY {} @ {:.4}",
+            market.label, side_name, entry_price
+        );
+
+        if dry_run {
+            println!("[DRY RUN] Would place market buy order: ${:.2} USDC for {}", size_usd, side_name);
+            position.token_side = Some(token_side);
+            position.entry_price = entry_price;
+            position.shares = (size_usd / entry_price * 100.0).floor() / 100.0;
+            position.entry_timestamp = timestamp;
+            return;
+        }
+
+        match place_market_buy(clob_client, signer, token_id, size_usd).await {
+            Ok(order_result) => {
+                let filled_size = order_result.filled_amount.map(decimal_to_f64).unwrap_or(size_usd / entry_price);
+                // Round DOWN to avoid trying to sell more than we have
+                let filled_rounded = (filled_size * 100.0).floor() / 100.0;
+                position.token_side = Some(token_side);
+                position.entry_price = entry_price;
+                position.shares = filled_rounded;
+                position.entry_timestamp = timestamp;
+                position.last_trade_id = Some(order_result.order_id.clone());
+
+                println!(
+                    "[ORDER FILLED] {} | {} @ {:.4} | {} shares | Order: {}",
+                    market.label, side_name, entry_price, filled_rounded, order_result.order_id
+                );
+            }
+            Err(err) => {
+                eprintln!("[ORDER FAILED] {:?}", err);
+            }
+        }
+        return;
+    }
+
+    match signal.exit {
+        ExitSignal::FullExit => {
+            if !position.is_active() {
+                return;
+            }
+
+            let (token_id, snapshot_side) = match position.token_side {
+                Some(TokenSide::Yes) => (market.yes_token_id, &dual_snapshot.yes),
+                Some(TokenSide::No) => (market.no_token_id, &dual_snapshot.no),
+                None => return,
+            };
+
+            let exit_price = best_bid_price(snapshot_side).unwrap_or(0.0);
+            if exit_price < 0.0001 {
+                println!("[NO EXIT BID] {:?}", position.token_side);
+                return;
+            }
+
+            let side_name = match position.token_side {
+                Some(TokenSide::Yes) => "YES",
+                Some(TokenSide::No) => "NO",
+                None => "N/A",
+            };
+
+            // Query ACTUAL token balance before selling (don't trust tracked shares)
+            let balance_request = BalanceAllowanceRequest::builder()
+                .asset_type(AssetType::Conditional)
+                .token_id(token_id)
+                .build();
+            
+            let actual_shares = match clob_client.balance_allowance(balance_request).await {
+                Ok(b) => {
+                    // Balance is in raw units (micro-shares), divide by 10^6
+                    const DECIMALS: u32 = 6;
+                    let divisor = Decimal::from(10u64.pow(DECIMALS));
+                    let human_balance = b.balance / divisor;
+                    let bal = decimal_to_f64(human_balance);
+                    (bal * 100.0).floor() / 100.0 // Round DOWN to 2 decimals
+                }
+                Err(_) => position.shares, // Fallback to tracked if query fails
+            };
+
+            if actual_shares < 0.01 {
+                println!("[NO SHARES] {} | {:?} | Balance too small", market.label, position.token_side);
+                position.reset(timestamp, false);
+                return;
+            }
+
+            let pnl_pct = (exit_price - position.entry_price) / position.entry_price * 100.0;
+            let pnl_usd = pnl_pct / 100.0 * (actual_shares * position.entry_price);
+
+            println!(
+                "[SIGNAL] {} | SELL {} @ {:.4} | {:.4} shares | PnL: {:.2}% (${:.2})",
+                market.label, side_name, exit_price, actual_shares, pnl_pct, pnl_usd
+            );
+
+            if dry_run {
+                println!("[DRY RUN] Would place market sell order: {} shares of {}", actual_shares, side_name);
+                let was_loss = pnl_pct < 0.0;
+                position.reset(timestamp, was_loss);
+                return;
+            }
+
+            match place_market_sell(clob_client, signer, token_id, actual_shares).await {
+                Ok(order_result) => {
+                    let was_loss = pnl_pct < 0.0;
+                    println!(
+                        "[EXIT FILLED] {} | {:.2}% | ${:.2} | Order: {}",
+                        market.label, pnl_pct, pnl_usd, order_result.order_id
+                    );
+                    position.reset(timestamp, was_loss);
+                }
+                Err(err) => {
+                    eprintln!("[EXIT FAILED] {:?} - Position remains open!", err);
+                }
+            }
+        }
+        ExitSignal::None => {}
+    }
+}
+
+async fn place_market_buy(
+    client: &clob::Client<Authenticated<Normal>>,
+    signer: &(impl polymarket_client_sdk::auth::Signer + Sync),
+    token_id: U256,
+    amount_usd: f64,
+) -> Result<OrderResult> {
+    let amount = Amount::usdc(Decimal::try_from(amount_usd)?)?;
+    
+    let order = client
+        .market_order()
+        .token_id(token_id)
+        .side(Side::Buy)
+        .amount(amount)
+        .order_type(OrderType::FOK)
+        .build()
+        .await?;
+
+    let signed_order = client.sign(signer, order).await?;
+    let result = client.post_order(signed_order).await?;
+
+    Ok(OrderResult {
+        order_id: result.order_id,
+        filled_amount: Some(result.taking_amount),
+    })
+}
+
+async fn place_market_sell(
+    client: &clob::Client<Authenticated<Normal>>,
+    signer: &(impl polymarket_client_sdk::auth::Signer + Sync),
+    token_id: U256,
+    shares: f64,
+) -> Result<OrderResult> {
+    // Round DOWN to 2 decimal places (API limit) - never try to sell more than we have
+    let shares_rounded = (shares * 100.0).floor() / 100.0;
+    if shares_rounded < 0.01 {
+        anyhow::bail!("Shares too small to sell: {}", shares);
+    }
+    let amount = Amount::shares(Decimal::try_from(shares_rounded)?)?;
+    
+    let order = client
+        .market_order()
+        .token_id(token_id)
+        .side(Side::Sell)
+        .amount(amount)
+        .order_type(OrderType::FOK)
+        .build()
+        .await?;
+
+    let signed_order = client.sign(signer, order).await?;
+    let result = client.post_order(signed_order).await?;
+
+    Ok(OrderResult {
+        order_id: result.order_id,
+        filled_amount: Some(result.taking_amount),
+    })
+}
+
+struct OrderResult {
+    order_id: String,
+    filled_amount: Option<Decimal>,
+}
+
+async fn get_usdc_balance(client: &clob::Client<Authenticated<Normal>>) -> Result<f64> {
+    const USDC_DECIMALS: u32 = 6;
+    let request = BalanceAllowanceRequest::builder()
+        .asset_type(AssetType::Collateral)
+        .build();
+    let balance = client.balance_allowance(request).await?;
+    let divisor = Decimal::from(10u64.pow(USDC_DECIMALS));
+    let human_balance = balance.balance / divisor;
+    Ok(decimal_to_f64(human_balance))
+}
+
+async fn discover_market_loop(client: &gamma::Client) -> WatchedMarket {
+    loop {
+        match discover_active_btc_market(client).await {
+            Ok(market) => {
+                println!(
+                    "Watching: {} [{}] (YES {}, NO {})",
+                    market.label, market.slug, market.yes_token_id, market.no_token_id
+                );
+                return market;
+            }
+            Err(err) => {
+                eprintln!("[warn] Could not find active BTC 5m market: {err:#}");
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+async fn discover_active_btc_market(client: &gamma::Client) -> Result<WatchedMarket> {
+    if let Some(market) = discover_by_time_slugs(client).await? {
+        return market_to_watched(market);
+    }
+
+    let mut candidates = search_candidates(client).await?;
+    if candidates.is_empty() {
+        candidates = list_open_market_candidates(client).await?;
+    }
+
+    let now = Utc::now();
+    let market = candidates
+        .into_iter()
+        .filter(is_btc_updown_slug_or_question)
+        .filter(|market| is_active_now(market, &now))
+        .min_by_key(|market| market.end_date);
+
+    match market {
+        Some(market) => market_to_watched(market),
+        None => Err(anyhow::anyhow!(
+            "no matching active BTC 5m market found"
+        )),
+    }
+}
+
+async fn discover_by_time_slugs(client: &gamma::Client) -> Result<Option<Market>> {
+    let now = Utc::now();
+    let mut active: Vec<Market> = Vec::new();
+
+    for ts in candidate_slug_timestamps(now.timestamp()) {
+        let slug = format!("{BTC_UPDOWN_SLUG_PREFIX}{ts}");
+        let request = MarketBySlugRequest::builder().slug(slug).build();
+
+        match client.market_by_slug(&request).await {
+            Ok(market) => {
+                if is_active_now(&market, &now) {
+                    active.push(market);
+                }
+            }
+            Err(err) => {
+                if !err.to_string().contains("404") {
+                    eprintln!("[warn] slug probe failed: {err}");
+                }
+            }
+        }
+    }
+
+    Ok(active.into_iter().min_by_key(|market| market.end_date))
+}
+
+fn candidate_slug_timestamps(now_ts: i64) -> Vec<i64> {
+    let base = now_ts.div_euclid(FIVE_MINUTES_SECONDS) * FIVE_MINUTES_SECONDS;
+    [-900, -600, -300, 0, 300, 600, 900]
+        .into_iter()
+        .map(|offset| base + offset)
+        .collect()
+}
+
+async fn search_candidates(client: &gamma::Client) -> Result<Vec<Market>> {
+    let request = SearchRequest::builder()
+        .q("btc-updown-5m")
+        .limit_per_type(50)
+        .build();
+    let results = client.search(&request).await?;
+    Ok(results
+        .events
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|event| event.markets.unwrap_or_default())
+        .collect())
+}
+
+async fn list_open_market_candidates(client: &gamma::Client) -> Result<Vec<Market>> {
+    let request = MarketsRequest::builder().limit(200).closed(false).build();
+    Ok(client.markets(&request).await?)
+}
+
+fn is_btc_updown_slug_or_question(market: &Market) -> bool {
+    market
+        .slug
+        .as_deref()
+        .is_some_and(|slug| slug.starts_with(BTC_UPDOWN_SLUG_PREFIX))
+        || market.question.as_deref().is_some_and(is_btc_up_down_5m)
+}
+
+fn is_btc_up_down_5m(question: &str) -> bool {
+    let normalized = question.to_ascii_lowercase();
+    (normalized.contains("btc") || normalized.contains("bitcoin"))
+        && normalized.contains("up")
+        && normalized.contains("down")
+        && (normalized.contains("5m")
+            || normalized.contains("5 min")
+            || normalized.contains("5-minute")
+            || normalized.contains("five minute"))
+}
+
+fn is_active_now(market: &Market, now: &DateTime<Utc>) -> bool {
+    if market.closed == Some(true) || market.active == Some(false) {
+        return false;
+    }
+
+    let starts_ok = market.start_date.as_ref().is_none_or(|start| start <= now);
+    let ends_ok = market.end_date.as_ref().is_some_and(|end| end > now);
+    starts_ok && ends_ok
+}
+
+fn market_to_watched(market: Market) -> Result<WatchedMarket> {
+    let (yes_token_id, no_token_id) = select_binary_tokens(&market)?;
+    let fallback_slug = format!("market-{}", market.id);
+    let end_time = market
+        .end_date
+        .context("market end date is missing")?;
+
+    let condition_id = market.condition_id.map(|c| format!("0x{}", alloy::hex::encode(c.as_slice())));
+
+    Ok(WatchedMarket {
+        label: market_label(&market),
+        slug: market.slug.unwrap_or(fallback_slug),
+        yes_token_id,
+        no_token_id,
+        condition_id,
+        end_time,
+    })
+}
+
+fn select_binary_tokens(market: &Market) -> Result<(U256, U256)> {
+    let outcomes = market
+        .outcomes
+        .as_ref()
+        .context("market outcomes missing")?;
+
+    let token_ids = market
+        .clob_token_ids
+        .as_ref()
+        .context("market CLOB token IDs missing")?;
+
+    if outcomes.len() != token_ids.len() || outcomes.len() != 2 {
+        anyhow::bail!("binary market expected exactly 2 outcomes");
+    }
+
+    let mut yes_index = None;
+    let mut no_index = None;
+
+    for (i, outcome) in outcomes.iter().enumerate() {
+        let normalized = outcome.to_ascii_lowercase();
+        if normalized.contains("yes") || normalized.contains("up") || normalized.contains("higher") {
+            yes_index = Some(i);
+        } else {
+            no_index = Some(i);
+        }
+    }
+
+    let yes_index = yes_index.context("YES outcome not found")?;
+    let no_index = no_index.context("NO outcome not found")?;
+
+    Ok((token_ids[yes_index], token_ids[no_index]))
+}
+
+async fn fetch_snapshot(client: &clob::Client, token_id: U256) -> Result<MarketSnapshot> {
+    let midpoint_request = MidpointRequest::builder().token_id(token_id).build();
+    let midpoint = match client.midpoint(&midpoint_request).await {
+        Ok(resp) => Some(resp.mid),
+        Err(err) => {
+            eprintln!("[warn] midpoint request failed: {err}");
+            None
+        }
+    };
+
+    // Use price API for actual tradable prices
+    // Side::Buy = price to buy at = ask
+    // Side::Sell = price to sell at = bid
+    let sell_request = PriceRequest::builder()
+        .token_id(token_id)
+        .side(Side::Sell)
+        .build();
+    let best_ask = match client.price(&sell_request).await {
+        Ok(resp) => Some(resp.price),
+        Err(err) => {
+            eprintln!("[warn] sell price request failed: {err}");
+            None
+        }
+    };
+
+    let buy_request = PriceRequest::builder()
+        .token_id(token_id)
+        .side(Side::Buy)
+        .build();
+    let best_bid = match client.price(&buy_request).await {
+        Ok(resp) => Some(resp.price),
+        Err(err) => {
+            eprintln!("[warn] buy price request failed: {err}");
+            None
+        }
+    };
+
+    let spread = match (best_bid, best_ask) {
+        (Some(bid), Some(ask)) => Some(ask - bid),
+        _ => None,
+    };
+
+    // Get depth from order book (still useful for liquidity assessment)
+    let book_request = OrderBookSummaryRequest::builder()
+        .token_id(token_id)
+        .build();
+    let book = match client.order_book(&book_request).await {
+        Ok(b) => b,
+        Err(err) => {
+            eprintln!("[warn] order book request failed: {err}");
+            return Ok(MarketSnapshot {
+                midpoint,
+                best_bid,
+                best_ask,
+                spread,
+                top5_bid_depth: Decimal::ZERO,
+                top5_ask_depth: Decimal::ZERO,
+            });
+        }
+    };
+
+    let top5_bid_depth = book
+        .bids
+        .iter()
+        .take(5)
+        .fold(Decimal::ZERO, |acc, level| acc + level.size);
+    let top5_ask_depth = book
+        .asks
+        .iter()
+        .take(5)
+        .fold(Decimal::ZERO, |acc, level| acc + level.size);
+
+    Ok(MarketSnapshot {
+        midpoint,
+        best_bid,
+        best_ask,
+        spread,
+        top5_bid_depth,
+        top5_ask_depth,
+    })
+}
+
+fn market_label(market: &Market) -> String {
+    if market
+        .slug
+        .as_deref()
+        .is_some_and(|slug| slug.starts_with(BTC_UPDOWN_SLUG_PREFIX))
+    {
+        if let Some(question) = market.question.as_deref() {
+            return btc_updown_label_from_question(question);
+        }
+    }
+
+    if let (Some(start), Some(end)) = (market.start_date.as_ref(), market.end_date.as_ref()) {
+        return format!(
+            "BTC 5m {:02}:{:02}-{:02}:{:02}",
+            start.hour(),
+            start.minute(),
+            end.hour(),
+            end.minute()
+        );
+    }
+
+    market
+        .question
+        .clone()
+        .unwrap_or_else(|| format!("Market {}", market.id))
+}
+
+fn btc_updown_label_from_question(question: &str) -> String {
+    question.split_once(" - ").map_or_else(
+        || question.to_string(),
+        |(_, suffix)| format!("BTC 5m {suffix}"),
+    )
+}
+
+fn decimal_to_f64(value: Decimal) -> f64 {
+    value.to_string().parse::<f64>().unwrap_or_default()
+}
+
+async fn run_backtest(args: BacktestArgs) -> Result<()> {
+    println!("[BACKTEST] Initializing...");
+    
+    let markets = if let Some(data_path) = &args.data {
+        println!("[BACKTEST] Loading data from: {}", data_path);
+        let mut parser = BeckerParser::new();
+        
+        if data_path.ends_with(".parquet") {
+            let count = parser.load_parquet(data_path)
+                .context("Failed to load parquet file")?;
+            println!("[BACKTEST] Loaded {} trades from parquet", count);
+        } else {
+            let count = parser.load_csv(data_path)
+                .context("Failed to load CSV file")?;
+            println!("[BACKTEST] Loaded {} trades from CSV", count);
+        }
+        
+        parser.organize_by_market();
+        parser.get_markets().values().cloned().collect()
+    } else {
+        println!("[BACKTEST] Using mock data (10 synthetic markets)");
+        load_mock_data()
+    };
+
+    println!("[BACKTEST] Running with entry band {:.2} - {:.2}", args.band_low, args.band_high);
+    println!("[BACKTEST] Starting capital: ${:.2}, Position size: ${:.2}", args.capital, args.size);
+
+    let config = BacktestConfig {
+        entry_band_low: args.band_low,
+        entry_band_high: args.band_high,
+        position_size_usd: args.size,
+        starting_capital: args.capital,
+        ..Default::default()
+    };
+
+    let mut engine = BacktestEngine::new(config);
+    let metrics = engine.run_all(&markets);
+    
+    metrics.print_summary();
+
+    if let Some(output_path) = &args.export {
+        metrics.export_json(output_path)
+            .context("Failed to export JSON")?;
+        println!("[BACKTEST] Results exported to: {}", output_path);
+        
+        let csv_path = output_path.replace(".json", "_trades.csv");
+        metrics.export_csv(&csv_path)
+            .context("Failed to export CSV")?;
+        println!("[BACKTEST] Trades exported to: {}", csv_path);
+    }
+
+    Ok(())
+}
+
+fn run_monte_carlo(args: MonteCarloArgs) -> Result<()> {
+    println!("[MONTE CARLO] Initializing...");
+
+    let config = if let Some(input_path) = &args.input {
+        println!("[MONTE CARLO] Loading backtest results from: {}", input_path);
+        let file = std::fs::File::open(input_path)
+            .context("Failed to open input file")?;
+        let metrics: crate::bot::backtest::metrics::BacktestMetrics = 
+            serde_json::from_reader(file)
+                .context("Failed to parse backtest JSON")?;
+        println!("[MONTE CARLO] Loaded {} trades", metrics.total_trades);
+        
+        let mut cfg = SimulationConfig::from_metrics(&metrics);
+        cfg.num_simulations = args.simulations;
+        cfg.num_trades_per_sim = args.trades;
+        cfg.position_size_pct = args.kelly;
+        cfg
+    } else {
+        println!("[MONTE CARLO] Using default parameters");
+        SimulationConfig {
+            num_simulations: args.simulations,
+            num_trades_per_sim: args.trades,
+            position_size_pct: args.kelly,
+            ..Default::default()
+        }
+    };
+
+    println!("[MONTE CARLO] Running {} simulations x {} trades each", 
+        config.num_simulations, config.num_trades_per_sim);
+    println!("[MONTE CARLO] Position size: {:.1}% Kelly", config.position_size_pct * 100.0);
+
+    let result = if let Some(seed) = args.seed {
+        let mut sim = MonteCarloSimulator::seeded(config, seed);
+        sim.run()
+    } else {
+        let mut sim = MonteCarloSimulator::new(config);
+        sim.run()
+    };
+
+    result.print_summary();
+
+    if let Some(output_path) = &args.export {
+        result.export_json(output_path)
+            .context("Failed to export JSON")?;
+        println!("[MONTE CARLO] Results exported to: {}", output_path);
+    }
+
+    Ok(())
+}
+
+fn run_parameter_sweep(args: SweepArgs) -> Result<()> {
+    println!("[SWEEP] Running parameter sweep...");
+
+    let markets = if let Some(data_path) = &args.data {
+        println!("[SWEEP] Loading data from: {}", data_path);
+        let mut parser = BeckerParser::new();
+        
+        if data_path.ends_with(".parquet") {
+            parser.load_parquet(data_path)
+                .context("Failed to load parquet file")?;
+        } else {
+            parser.load_csv(data_path)
+                .context("Failed to load CSV file")?;
+        }
+        
+        parser.organize_by_market();
+        parser.get_markets().values().cloned().collect()
+    } else {
+        println!("[SWEEP] Using mock data");
+        load_mock_data()
+    };
+
+    let bands: Vec<(f64, f64)> = vec![
+        (0.25, 0.75),
+        (0.30, 0.70),
+        (0.35, 0.65),
+        (0.40, 0.60),
+        (0.45, 0.55),
+    ];
+
+    let results = crate::bot::backtest::replay::run_parameter_sweep(&markets, &bands);
+    
+    ParameterSweepResult::print_comparison(&results);
+
+    if let Some(output_path) = &args.export {
+        let file = std::fs::File::create(output_path)
+            .context("Failed to create output file")?;
+        serde_json::to_writer_pretty(file, &results)
+            .context("Failed to write JSON")?;
+        println!("[SWEEP] Results exported to: {}", output_path);
+    }
+
+    Ok(())
+}
+
+async fn run_fetch_pmxt(args: FetchPmxtArgs) -> Result<()> {
+    println!("[PMXT] Initializing DuckDB with httpfs extension...");
+
+    let fetcher = PmxtFetcher::new()
+        .context("Failed to initialize PmxtFetcher")?
+        .with_filter(&args.filter);
+
+    let rows = fetcher.fetch_url(&args.url)
+        .context("Failed to fetch remote Parquet data")?;
+
+    if rows.is_empty() {
+        println!("[PMXT] No rows matched filter pattern: {}", args.filter);
+        return Ok(());
+    }
+
+    println!("[PMXT] Fetched {} rows matching '{}'", rows.len(), args.filter);
+
+    let mut sample_printed = false;
+    for row in rows.iter().take(5) {
+        if !sample_printed {
+            println!("[PMXT] Sample rows:");
+            sample_printed = true;
+        }
+        println!(
+            "  {} | ts={} | yes_mid={:.4} | no_mid={:.4}",
+            row.market_slug, row.timestamp, row.yes_midpoint, row.no_midpoint
+        );
+    }
+
+    if let Some(csv_path) = &args.csv {
+        PmxtFetcher::export_csv(&rows, csv_path)
+            .context("Failed to export CSV")?;
+    }
+
+    if let Some(parquet_path) = &args.parquet {
+        fetcher.export_parquet_direct(&args.url, parquet_path)
+            .context("Failed to export Parquet")?;
+    }
+
+    if args.backtest {
+        println!("[PMXT] Running backtest on fetched data...");
+        
+        let trades = crate::bot::backtest::pmxt::PmxtFetcher::to_trades(&rows);
+        println!("[PMXT] Converted {} rows to {} trades", rows.len(), trades.len());
+
+        let mut markets: std::collections::HashMap<String, crate::bot::backtest::MarketData> = 
+            std::collections::HashMap::new();
+        
+        for trade in &trades {
+            let market = markets.entry(trade.market_slug.clone())
+                .or_insert_with(|| crate::bot::backtest::MarketData {
+                    slug: trade.market_slug.clone(),
+                    yes_token_id: String::new(),
+                    no_token_id: String::new(),
+                    start_time: trade.timestamp,
+                    end_time: trade.timestamp,
+                    resolution: None,
+                    trades: Vec::new(),
+                });
+            
+            market.trades.push(trade.clone());
+            market.start_time = market.start_time.min(trade.timestamp);
+            market.end_time = market.end_time.max(trade.timestamp);
+        }
+
+        let markets: Vec<_> = markets.values().cloned().collect();
+        println!("[PMXT] Organized into {} markets", markets.len());
+
+        let config = BacktestConfig::default();
+        let mut engine = BacktestEngine::new(config);
+        let metrics = engine.run_all(&markets);
+
+        metrics.print_summary();
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GammaMarket {
+    slug: Option<String>,
+    #[serde(rename = "conditionId")]
+    condition_id: Option<String>,
+    #[serde(rename = "condition_id")]
+    condition_id_alt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MidpointRow {
+    market_id: String,
+    market_slug: String,
+    timestamp: i64,
+    midpoint: f64,
+    best_bid: f64,
+    best_ask: f64,
+}
+
+fn extract_hour_from_filename(filename: &str) -> Option<i64> {
+    let re = regex::Regex::new(r"(\d{4})-(\d{2})-(\d{2})T(\d{2})").ok()?;
+    let caps = re.captures(filename)?;
+    
+    let year: i32 = caps.get(1)?.as_str().parse().ok()?;
+    let month: u32 = caps.get(2)?.as_str().parse().ok()?;
+    let day: u32 = caps.get(3)?.as_str().parse().ok()?;
+    let hour: u32 = caps.get(4)?.as_str().parse().ok()?;
+    
+    chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .and_then(|d| d.and_hms_opt(hour, 0, 0))
+        .map(|dt| dt.and_utc().timestamp())
+}
+
+async fn probe_btc_updown_slugs(hour_ts: i64) -> Result<Vec<(String, String)>> {
+    println!("[PROBE] Probing BTC up/down markets around timestamp {}...", hour_ts);
+    
+    let client = reqwest::Client::builder()
+        .user_agent("polymarket-cli")
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("Failed to build HTTP client")?;
+
+    let mut result = Vec::new();
+    
+    let base_5m = hour_ts.div_euclid(FIVE_MINUTES_SECONDS) * FIVE_MINUTES_SECONDS;
+    
+    for offset in [-900, -600, -300, 0, 300, 600, 900, 1200, 1500, 1800, 2100, 2400, 2700, 3000, 3300, 3600] {
+        let ts = base_5m + offset;
+        let slug = format!("btc-updown-5m-{}", ts);
+        
+        let url = format!("https://gamma-api.polymarket.com/markets?slug={}", slug);
+        
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<Vec<GammaMarket>>().await {
+                    Ok(markets) => {
+                        for m in markets {
+                            if let (Some(s), Some(c)) = (m.slug.clone(), m.condition_id.or(m.condition_id_alt)) {
+                                if !c.is_empty() {
+                                    println!("[PROBE] Found: {} -> {}", s, c);
+                                    result.push((c, s));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    println!("[PROBE] Found {} BTC up/down markets", result.len());
+    Ok(result)
+}
+
+async fn fetch_btc_condition_ids(filter: &str) -> Result<Vec<(String, String)>> {
+    println!("[GAMMA] Fetching markets from Gamma API...");
+
+    let client = reqwest::Client::builder()
+        .user_agent("polymarket-cli")
+        .build()
+        .context("Failed to build HTTP client")?;
+
+    let url = "https://gamma-api.polymarket.com/markets?limit=10000";
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .context("Failed to call Gamma API")?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("Gamma API returned status: {}", resp.status());
+    }
+
+    let markets: Vec<GammaMarket> = resp
+        .json()
+        .await
+        .context("Failed to parse Gamma API response")?;
+
+    let filter_lower = filter.to_lowercase();
+    let mut result = Vec::new();
+
+    for m in markets {
+        let slug = match m.slug {
+            Some(s) => s,
+            None => continue,
+        };
+
+        if !slug.to_lowercase().contains(&filter_lower) {
+            continue;
+        }
+
+        let cond_id = m.condition_id.or(m.condition_id_alt).unwrap_or_default();
+        if !cond_id.is_empty() {
+            result.push((cond_id, slug));
+        }
+    }
+
+    println!("[GAMMA] Found {} markets matching '{}'", result.len(), filter);
+    Ok(result)
+}
+
+async fn run_extract_midpoints(args: ExtractMidpointsArgs) -> Result<()> {
+    let condition_ids = if args.filter.contains("updown") || args.filter.contains("btc") {
+        if let Some(hour_ts) = extract_hour_from_filename(&args.input) {
+            println!("[EXTRACT] Detected hour {} from filename, probing for BTC up/down markets...", hour_ts);
+            probe_btc_updown_slugs(hour_ts).await?
+        } else {
+            println!("[EXTRACT] Could not detect timestamp from filename, trying general search...");
+            fetch_btc_condition_ids(&args.filter).await?
+        }
+    } else {
+        println!("[EXTRACT] Fetching condition IDs from Gamma API...");
+        fetch_btc_condition_ids(&args.filter).await?
+    };
+
+    if condition_ids.is_empty() {
+        println!("[EXTRACT] No matching markets found. Exiting.");
+        return Ok(());
+    }
+
+    if args.dry_run {
+        println!("[EXTRACT] Dry run - condition IDs:");
+        for (cond_id, slug) in &condition_ids {
+            println!("  {} -> {}", slug, cond_id);
+        }
+        return Ok(());
+    }
+
+    println!("[EXTRACT] Loading Parquet: {}", args.input);
+    println!("[EXTRACT] Initializing DuckDB...");
+
+    let conn = duckdb::Connection::open_in_memory()
+        .context("Failed to create DuckDB connection")?;
+
+    conn.execute_batch("INSTALL httpfs; LOAD httpfs;")
+        .context("Failed to load httpfs extension")?;
+
+    conn.execute_batch("PRAGMA threads='4'; PRAGMA memory_limit='4GB';")
+        .context("Failed to set DuckDB pragmas")?;
+
+    conn.execute_batch(&format!(
+        "CREATE VIEW raw_data AS SELECT * FROM read_parquet('{}');",
+        args.input
+    ))
+    .context("Failed to create view from Parquet")?;
+
+    let id_list: Vec<String> = condition_ids
+        .iter()
+        .map(|(id, _)| format!("'{}'", id))
+        .collect();
+    let id_list = id_list.join(",");
+
+    println!("[EXTRACT] Querying midpoint data for {} condition IDs...", condition_ids.len());
+
+    let sql = format!(
+        r#"
+        SELECT
+            market_id,
+            CAST(data ->> '$.timestamp' AS DOUBLE) AS ts,
+            (CAST(data ->> '$.best_bid' AS DOUBLE) +
+             CAST(data ->> '$.best_ask' AS DOUBLE)) / 2.0 AS midpoint,
+            CAST(data ->> '$.best_bid' AS DOUBLE) AS best_bid,
+            CAST(data ->> '$.best_ask' AS DOUBLE) AS best_ask,
+            data ->> '$.side' AS side
+        FROM raw_data
+        WHERE market_id IN ({})
+        ORDER BY ts
+        "#,
+        id_list
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare query")?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<f64>>(1)?,
+                row.get::<_, Option<f64>>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })
+        .context("Failed to execute query")?;
+
+    let id_to_slug: std::collections::HashMap<String, String> = condition_ids
+        .into_iter()
+        .map(|(id, slug)| (id, slug))
+        .collect();
+
+    let mut results: Vec<MidpointRow> = Vec::new();
+    for row in rows {
+        let (market_id, ts, midpoint, best_bid, best_ask, side) = row?;
+        let slug = id_to_slug.get(&market_id).cloned().unwrap_or_else(|| market_id.clone());
+        let timestamp = ts.unwrap_or(0.0) as i64;
+        let mid = midpoint.unwrap_or(0.0);
+        let bid = best_bid.unwrap_or(0.0);
+        let ask = best_ask.unwrap_or(0.0);
+        
+        results.push(MidpointRow {
+            market_id: market_id.clone(),
+            market_slug: slug,
+            timestamp,
+            midpoint: mid,
+            best_bid: bid,
+            best_ask: ask,
+        });
+    }
+
+    println!("[EXTRACT] Extracted {} midpoint records", results.len());
+
+    if results.is_empty() {
+        println!("[EXTRACT] No matching rows found in Parquet file.");
+        return Ok(());
+    }
+
+    println!("[EXTRACT] Sample rows:");
+    for row in results.iter().take(5) {
+        println!(
+            "  {} | ts={} | mid={:.4} | bid={:.4} | ask={:.4}",
+            row.market_slug, row.timestamp, row.midpoint, row.best_bid, row.best_ask
+        );
+    }
+
+    if let Some(csv_path) = &args.csv {
+        println!("[EXTRACT] Exporting to CSV: {}", csv_path);
+        let mut wtr = csv::Writer::from_path(csv_path)
+            .context("Failed to create CSV writer")?;
+
+        for row in &results {
+            wtr.serialize(row)
+                .with_context(|| format!("Failed to serialize row for: {}", row.market_slug))?;
+        }
+
+        wtr.flush().context("Failed to flush CSV")?;
+        println!("[EXTRACT] Exported {} rows to {}", results.len(), csv_path);
+    } else {
+        println!("[EXTRACT] Tip: Use --csv <path> to export results");
+    }
+
+    Ok(())
+}
+
+fn run_inspect_parquet(args: InspectParquetArgs) -> Result<()> {
+    println!("[INSPECT] Loading Parquet file: {}", args.input);
+
+    let conn = duckdb::Connection::open_in_memory()
+        .context("Failed to create DuckDB connection")?;
+
+    conn.execute_batch("INSTALL httpfs; LOAD httpfs;")
+        .context("Failed to load httpfs extension")?;
+
+    println!("[INSPECT] Schema:");
+    let schema_sql = format!("DESCRIBE SELECT * FROM read_parquet('{}');", args.input);
+    let mut schema_stmt = conn.prepare(&schema_sql)
+        .context("Failed to describe schema")?;
+
+    let schema_rows = schema_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
+        })
+        .context("Failed to fetch schema")?;
+
+    for row in schema_rows {
+        let (col_name, col_type) = row?;
+        println!("  {} ({})", col_name, col_type);
+    }
+
+    let sample_sql = if let Some(market_id) = &args.market_id {
+        format!(
+            "SELECT * FROM read_parquet('{}') WHERE market_id = '{}' LIMIT {};",
+            args.input, market_id, args.sample
+        )
+    } else if let Some(token_id) = &args.token_id {
+        format!(
+            "SELECT * FROM read_parquet('{}') WHERE data ->> '$.token_id' = '{}' LIMIT {};",
+            args.input, token_id, args.sample
+        )
+    } else {
+        format!(
+            "SELECT * FROM read_parquet('{}') LIMIT {};",
+            args.input, args.sample
+        )
+    };
+
+    println!("\n[INSPECT] Sample {} rows:", args.sample);
+    let mut sample_stmt = conn.prepare(&sample_sql)
+        .context("Failed to prepare sample query")?;
+
+    let sample_rows = sample_stmt
+        .query_map([], |row| {
+            let mut cols = Vec::new();
+            for i in 0..10 {
+                match row.get::<_, Option<String>>(i) {
+                    Ok(Some(v)) => cols.push(v),
+                    _ => cols.push("NULL".to_string()),
+                }
+            }
+            Ok(cols)
+        })
+        .context("Failed to fetch sample rows")?;
+
+    for (i, row) in sample_rows.enumerate() {
+        let cols = row?;
+        println!("  Row {}: {}", i + 1, cols.join(" | "));
+    }
+
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM read_parquet('{}');",
+        args.input
+    );
+    let count: i64 = conn.query_row(&count_sql, [], |row| row.get(0))
+        .context("Failed to count rows")?;
+    println!("\n[INSPECT] Total rows: {}", count);
+
+    if args.market_id.is_none() && args.token_id.is_none() {
+        let markets_sql = format!(
+            "SELECT market_id, COUNT(*) as cnt FROM read_parquet('{}') GROUP BY market_id ORDER BY cnt DESC LIMIT 20;",
+            args.input
+        );
+        println!("\n[INSPECT] Top 20 markets by row count:");
+        let mut markets_stmt = conn.prepare(&markets_sql)
+            .context("Failed to prepare markets query")?;
+
+        let market_rows = markets_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                ))
+            })
+            .context("Failed to fetch market counts")?;
+
+        for (i, row) in market_rows.enumerate() {
+            let (market_id, count) = row?;
+            println!("  {}. {} ({} rows)", i + 1, market_id, count);
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ParquetMarketStat {
+    condition_id: String,
+    ticks: i64,
+    min_ts: f64,
+    max_ts: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DiscoveredMarket {
+    condition_id: String,
+    slug: String,
+    question: String,
+    start_ts: i64,
+    end_ts: i64,
+    ticks: i64,
+    min_ts: f64,
+    max_ts: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedSlugMarket {
+    condition_id: String,
+    slug: String,
+    question: String,
+    start_ts: i64,
+    end_ts: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ListMarketsOutput {
+    input: String,
+    crypto: CryptoAsset,
+    min_ticks: usize,
+    hour_start_ts: Option<i64>,
+    discovered_count: usize,
+    markets: Vec<DiscoveredMarket>,
+}
+
+fn load_parquet_market_stats(
+    conn: &duckdb::Connection,
+    input: &str,
+    min_ticks: usize,
+) -> Result<Vec<ParquetMarketStat>> {
+    let sql = format!(
+        r#"
+        SELECT
+            market_id,
+            COUNT(*) AS ticks,
+            MIN(CAST(data ->> '$.timestamp' AS DOUBLE)) AS min_ts,
+            MAX(CAST(data ->> '$.timestamp' AS DOUBLE)) AS max_ts
+        FROM read_parquet('{}')
+        GROUP BY market_id
+        HAVING COUNT(*) >= {}
+        ORDER BY min_ts ASC
+        "#,
+        input, min_ticks
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare market stats query")?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(ParquetMarketStat {
+                condition_id: row.get::<_, String>(0)?,
+                ticks: row.get::<_, i64>(1)?,
+                min_ts: row.get::<_, f64>(2)?,
+                max_ts: row.get::<_, f64>(3)?,
+            })
+        })
+        .context("Failed to execute market stats query")?;
+
+    let mut stats = Vec::new();
+    for row in rows {
+        stats.push(row?);
+    }
+    Ok(stats)
+}
+
+fn load_parquet_market_stats_for_ids(
+    conn: &duckdb::Connection,
+    input: &str,
+    condition_ids: &[String],
+) -> Result<Vec<ParquetMarketStat>> {
+    if condition_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let quoted_ids = condition_ids
+        .iter()
+        .map(|id| format!("'{}'", id))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let sql = format!(
+        r#"
+        SELECT
+            market_id,
+            COUNT(*) AS ticks,
+            MIN(CAST(data ->> '$.timestamp' AS DOUBLE)) AS min_ts,
+            MAX(CAST(data ->> '$.timestamp' AS DOUBLE)) AS max_ts
+        FROM read_parquet('{}')
+        WHERE market_id IN ({})
+        GROUP BY market_id
+        ORDER BY min_ts ASC
+        "#,
+        input, quoted_ids
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare filtered market stats query")?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(ParquetMarketStat {
+                condition_id: row.get::<_, String>(0)?,
+                ticks: row.get::<_, i64>(1)?,
+                min_ts: row.get::<_, f64>(2)?,
+                max_ts: row.get::<_, f64>(3)?,
+            })
+        })
+        .context("Failed to execute filtered market stats query")?;
+
+    let mut stats = Vec::new();
+    for row in rows {
+        stats.push(row?);
+    }
+    Ok(stats)
+}
+
+fn hour_btc_5m_slugs(hour_start_ts: i64) -> Vec<String> {
+    (0..12)
+        .map(|idx| {
+            let start_ts = hour_start_ts + (idx as i64 * FIVE_MINUTES_SECONDS);
+            format!("{BTC_UPDOWN_SLUG_PREFIX}{start_ts}")
+        })
+        .collect()
+}
+
+fn gamma_market_condition_id_hex(market: &Market) -> Option<String> {
+    market
+        .condition_id
+        .as_ref()
+        .map(|bytes| format!("0x{}", alloy::hex::encode(bytes.as_slice())))
+}
+
+async fn resolve_btc_hour_slug_markets(
+    hour_start_ts: i64,
+    verbose: bool,
+) -> Result<Vec<ResolvedSlugMarket>> {
+    let gamma_client = gamma::Client::default();
+    let mut resolved = Vec::new();
+
+    for slug in hour_btc_5m_slugs(hour_start_ts) {
+        let req = MarketBySlugRequest::builder().slug(slug.clone()).build();
+        let market = match gamma_client.market_by_slug(&req).await {
+            Ok(market) => market,
+            Err(err) => {
+                if verbose {
+                    eprintln!("[LIST] slug lookup failed for {}: {}", slug, err);
+                }
+                continue;
+            }
+        };
+
+        let Some(condition_id) = gamma_market_condition_id_hex(&market) else {
+            if verbose {
+                eprintln!("[LIST] slug {} has no condition_id", slug);
+            }
+            continue;
+        };
+        let Some(start_ts) = parse_slug_timestamp(&slug) else {
+            continue;
+        };
+        let end_ts = start_ts + FIVE_MINUTES_SECONDS;
+
+        resolved.push(ResolvedSlugMarket {
+            condition_id,
+            slug,
+            question: market.question.unwrap_or_default(),
+            start_ts,
+            end_ts,
+        });
+    }
+
+    resolved.sort_by_key(|m| (m.start_ts, m.end_ts));
+    resolved.dedup_by(|a, b| a.condition_id == b.condition_id);
+    Ok(resolved)
+}
+
+fn is_updown_5m_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let has_updown = lower.contains("up") && lower.contains("down");
+    let has_5m = lower.contains("5m") || lower.contains("5-minute") || lower.contains("5 minute");
+    has_updown && has_5m
+}
+
+fn matches_crypto_text(text: &str, crypto: CryptoAsset) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let has = |terms: &[&str]| terms.iter().any(|term| lower.contains(term));
+
+    match crypto {
+        CryptoAsset::Btc => has(&["btc", "bitcoin"]),
+        CryptoAsset::Eth => has(&["eth", "ethereum"]),
+        CryptoAsset::Sol => has(&["sol", "solana"]),
+        CryptoAsset::Xrp => has(&["xrp", "ripple"]),
+        CryptoAsset::All => has(&["btc", "bitcoin", "eth", "ethereum", "sol", "solana", "xrp", "ripple"]),
+    }
+}
+
+fn has_binary_directional_tokens(market: &MarketResponse) -> bool {
+    if market.tokens.len() != 2 {
+        return false;
+    }
+
+    let mut has_positive = false;
+    let mut has_negative = false;
+    for token in &market.tokens {
+        let outcome = token.outcome.to_ascii_lowercase();
+        if matches!(outcome.as_str(), "yes" | "up" | "above") {
+            has_positive = true;
+        } else if matches!(outcome.as_str(), "no" | "down" | "below") {
+            has_negative = true;
+        }
+    }
+    has_positive && has_negative
+}
+
+fn parse_slug_timestamp(slug: &str) -> Option<i64> {
+    let suffix = slug.rsplit('-').next()?;
+    if suffix.len() < 10 || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse::<i64>().ok().filter(|ts| *ts > 0)
+}
+
+fn infer_market_window(market: &MarketResponse) -> Option<(i64, i64)> {
+    // Recurring crypto Up/Down contracts encode the market start in the slug:
+    // `btc-updown-5m-<unix_start_ts>`.
+    if let Some(start_ts) = parse_slug_timestamp(&market.market_slug) {
+        return Some((start_ts, start_ts + FIVE_MINUTES_SECONDS));
+    }
+
+    let end_ts = market.end_date_iso.as_ref()?.timestamp();
+    let start_ts = end_ts - FIVE_MINUTES_SECONDS;
+    Some((start_ts, end_ts))
+}
+
+fn window_overlaps_hour(start_ts: i64, end_ts: i64, hour_start_ts: i64) -> bool {
+    let hour_end_ts = hour_start_ts + 3600;
+    end_ts > hour_start_ts && start_ts < hour_end_ts
+}
+
+fn market_matches_exact_filter(
+    market: &MarketResponse,
+    crypto: CryptoAsset,
+    slug_filter: Option<&str>,
+) -> bool {
+    let combined = format!(
+        "{} {}",
+        market.question.to_ascii_lowercase(),
+        market.market_slug.to_ascii_lowercase()
+    );
+
+    if !is_updown_5m_text(&combined) {
+        return false;
+    }
+    if !matches_crypto_text(&combined, crypto) {
+        return false;
+    }
+    if !has_binary_directional_tokens(market) {
+        return false;
+    }
+
+    if let Some(filter) = slug_filter {
+        let normalized = filter.to_ascii_lowercase();
+        if !normalized.is_empty() && !combined.contains(&normalized) {
+            return false;
+        }
+    }
+    true
+}
+
+async fn discover_markets_for_input(
+    conn: &duckdb::Connection,
+    input: &str,
+    min_ticks: usize,
+    crypto: CryptoAsset,
+    slug_filter: Option<&str>,
+    verbose: bool,
+) -> Result<Vec<DiscoveredMarket>> {
+    let hour_start_ts = extract_hour_from_filename(input);
+
+    if crypto == CryptoAsset::Btc {
+        if let Some(hour_ts) = hour_start_ts {
+            let slug_filter_allows_btc = slug_filter
+                .map(|f| f.trim().is_empty() || f.to_ascii_lowercase().contains("btc-updown-5m"))
+                .unwrap_or(true);
+
+            if slug_filter_allows_btc {
+                let resolved = resolve_btc_hour_slug_markets(hour_ts, verbose).await?;
+                let resolved_ids: Vec<String> = resolved
+                    .iter()
+                    .map(|m| m.condition_id.clone())
+                    .collect();
+                let stats = load_parquet_market_stats_for_ids(conn, input, &resolved_ids)?;
+                let stats_by_id: std::collections::HashMap<String, ParquetMarketStat> = stats
+                    .into_iter()
+                    .map(|s| (s.condition_id.clone(), s))
+                    .collect();
+
+                let mut discovered = Vec::new();
+                for market in resolved {
+                    let Some(stat) = stats_by_id.get(&market.condition_id) else {
+                        if verbose {
+                            eprintln!(
+                                "[LIST] missing in parquet for hour {}: {} ({})",
+                                hour_ts, market.slug, market.condition_id
+                            );
+                        }
+                        continue;
+                    };
+
+                    if stat.ticks < min_ticks as i64 {
+                        continue;
+                    }
+
+                    discovered.push(DiscoveredMarket {
+                        condition_id: market.condition_id,
+                        slug: market.slug,
+                        question: market.question,
+                        start_ts: market.start_ts,
+                        end_ts: market.end_ts,
+                        ticks: stat.ticks,
+                        min_ts: stat.min_ts,
+                        max_ts: stat.max_ts,
+                    });
+                }
+
+                discovered.sort_by_key(|m| (m.start_ts, m.end_ts));
+                discovered.dedup_by(|a, b| a.condition_id == b.condition_id);
+                return Ok(discovered);
+            }
+        }
+    }
+
+    let stats = load_parquet_market_stats(conn, input, min_ticks)?;
+
+    let mut discovered = Vec::new();
+    let mut failed_lookups = 0usize;
+    let total_candidates = stats.len();
+    let mut completed = 0usize;
+    let mut queue = std::collections::VecDeque::from(stats);
+    let mut in_flight = tokio::task::JoinSet::new();
+    let max_in_flight = 24usize;
+
+    while !queue.is_empty() || !in_flight.is_empty() {
+        while in_flight.len() < max_in_flight {
+            let Some(stat) = queue.pop_front() else {
+                break;
+            };
+            in_flight.spawn(async move {
+                let condition_id = stat.condition_id.clone();
+                let client = clob::Client::default();
+                let market = client.market(&condition_id).await.map_err(|err| err.to_string());
+                (stat, market)
+            });
+        }
+
+        let Some(join_result) = in_flight.join_next().await else {
+            break;
+        };
+        completed += 1;
+        if verbose && completed % 500 == 0 {
+            eprintln!("[LIST] resolved metadata {}/{}", completed, total_candidates);
+        }
+
+        let (stat, market_result) = match join_result {
+            Ok(value) => value,
+            Err(err) => {
+                failed_lookups += 1;
+                if verbose {
+                    eprintln!("[LIST] metadata task failed: {}", err);
+                }
+                continue;
+            }
+        };
+
+        let market = match market_result {
+            Ok(market) => market,
+            Err(err) => {
+                failed_lookups += 1;
+                if verbose {
+                    eprintln!("[LIST] metadata lookup failed for {}: {}", stat.condition_id, err);
+                }
+                continue;
+            }
+        };
+
+        if !market_matches_exact_filter(&market, crypto, slug_filter) {
+            continue;
+        }
+
+        let Some((start_ts, end_ts)) = infer_market_window(&market) else {
+            continue;
+        };
+
+        if end_ts <= start_ts {
+            continue;
+        }
+        if start_ts % FIVE_MINUTES_SECONDS != 0 {
+            continue;
+        }
+
+        if let Some(hour_ts) = hour_start_ts {
+            if !window_overlaps_hour(start_ts, end_ts, hour_ts) {
+                continue;
+            }
+        }
+
+        discovered.push(DiscoveredMarket {
+            condition_id: stat.condition_id,
+            slug: market.market_slug,
+            question: market.question,
+            start_ts,
+            end_ts,
+            ticks: stat.ticks,
+            min_ts: stat.min_ts,
+            max_ts: stat.max_ts,
+        });
+    }
+
+    if discovered.is_empty() && failed_lookups > 0 {
+        anyhow::bail!(
+            "Failed to resolve CLOB metadata for all candidate markets ({} lookup failures)",
+            failed_lookups
+        );
+    }
+
+    discovered.sort_by_key(|m| (m.start_ts, m.end_ts, m.condition_id.clone()));
+    discovered.dedup_by(|a, b| a.condition_id == b.condition_id);
+    Ok(discovered)
+}
+
+async fn run_list_markets(args: ListMarketsArgs) -> Result<()> {
+    let conn = duckdb::Connection::open_in_memory()
+        .context("Failed to create DuckDB connection")?;
+    conn.execute_batch("INSTALL httpfs; LOAD httpfs;")
+        .context("Failed to load httpfs extension")?;
+    conn.execute_batch("PRAGMA threads='4'; PRAGMA memory_limit='4GB';")
+        .context("Failed to set DuckDB pragmas")?;
+
+    let discovered = discover_markets_for_input(
+        &conn,
+        &args.input,
+        args.min_ticks,
+        args.crypto,
+        None,
+        args.verbose,
+    )
+    .await?;
+
+    if args.table {
+        println!(
+            "{:<4} | {:<12} | {:<12} | {:<8} | {:<68}",
+            "#", "Start", "End", "Ticks", "Condition ID"
+        );
+        println!("{}", "-".repeat(125));
+        for (idx, market) in discovered.iter().enumerate() {
+            let start_label = chrono::DateTime::from_timestamp(market.start_ts, 0)
+                .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+                .format("%H:%M:%S")
+                .to_string();
+            let end_label = chrono::DateTime::from_timestamp(market.end_ts, 0)
+                .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+                .format("%H:%M:%S")
+                .to_string();
+            println!(
+                "{:<4} | {:<12} | {:<12} | {:<8} | {}",
+                idx + 1,
+                start_label,
+                end_label,
+                market.ticks,
+                market.condition_id
+            );
+            println!("     | {}", market.slug);
+        }
+        return Ok(());
+    }
+
+    let output = ListMarketsOutput {
+        input: args.input.clone(),
+        crypto: args.crypto,
+        min_ticks: args.min_ticks,
+        hour_start_ts: extract_hour_from_filename(&args.input),
+        discovered_count: discovered.len(),
+        markets: discovered,
+    };
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct OrderbookTick {
+    market_id: String,
+    market_slug: String,
+    timestamp: f64,
+    side: String,
+    best_bid: f64,
+    best_ask: f64,
+    midpoint: f64,
+}
+
+struct MarketState {
+    slug: String,
+    condition_id: String,
+    start_time: i64,
+    end_time: i64,
+    current_bid: f64,
+    current_ask: f64,
+    current_midpoint: f64,
+    last_tick_ts: f64,
+    ticks_received: usize,
+    candle_engine: CandleEngine,
+    ind_5s: IndicatorEngine,
+    ind_1m: IndicatorEngine,
+    signal_engine: SignalEngine,
+    shadow: ShadowPosition,
+}
+
+struct PipelineMetrics {
+    total_ticks: usize,
+    total_markets: usize,
+    trades_taken: usize,
+    wins: usize,
+    losses: usize,
+    total_pnl: f64,
+    total_pnl_pct: f64,
+    starting_capital: f64,
+    ending_capital: f64,
+    peak_capital: f64,
+    max_drawdown: f64,
+}
+
+impl PipelineMetrics {
+    fn new(starting_capital: f64) -> Self {
+        Self {
+            total_ticks: 0,
+            total_markets: 0,
+            trades_taken: 0,
+            wins: 0,
+            losses: 0,
+            total_pnl: 0.0,
+            total_pnl_pct: 0.0,
+            starting_capital,
+            ending_capital: starting_capital,
+            peak_capital: starting_capital,
+            max_drawdown: 0.0,
+        }
+    }
+
+    fn print_summary(&self) {
+        println!("\n{}", "=".repeat(60));
+        println!("BACKTEST PIPELINE RESULTS");
+        println!("{}", "=".repeat(60));
+        println!("Total ticks processed: {}", self.total_ticks);
+        println!("Total markets: {}", self.total_markets);
+        println!("Trades taken: {}", self.trades_taken);
+        println!("Wins / Losses: {} / {}", self.wins, self.losses);
+        
+        if self.trades_taken > 0 {
+            println!("Win rate: {:.1}%", (self.wins as f64 / self.trades_taken as f64) * 100.0);
+        }
+        
+        println!("\n--- PnL ---");
+        println!("Starting capital: ${:.2}", self.starting_capital);
+        println!("Ending capital: ${:.2}", self.ending_capital);
+        println!("Total PnL: ${:.2} ({:.2}%)", self.total_pnl, self.total_pnl_pct);
+        println!("Max drawdown: {:.2}%", self.max_drawdown * 100.0);
+        println!("{}", "=".repeat(60));
+    }
+}
+
+fn generate_hourly_urls(start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut current = start;
+    
+    while current < end {
+        let url = format!(
+            "https://r2.pmxt.dev/polymarket_orderbook_{}.parquet",
+            current.format("%Y-%m-%dT%H")
+        );
+        urls.push(url);
+        current = current + chrono::Duration::hours(1);
+    }
+    
+    urls
+}
+
+fn resolve_pipeline_inputs(
+    input: Option<&str>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Vec<String> {
+    match input {
+        Some(path) => vec![path.to_string()],
+        None => generate_hourly_urls(start, end),
+    }
+}
+
+async fn fetch_condition_ids_for_hour(hour_ts: i64) -> Result<std::collections::HashMap<String, String>> {
+    let client = reqwest::Client::builder()
+        .user_agent("polymarket-cli")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("Failed to build HTTP client")?;
+
+    let mut result = std::collections::HashMap::new();
+    
+    let base_5m = hour_ts.div_euclid(FIVE_MINUTES_SECONDS) * FIVE_MINUTES_SECONDS;
+    
+    for offset in [-1800, -1500, -1200, -900, -600, -300, 0, 300, 600, 900, 1200, 1500, 1800, 2100, 2400, 2700, 3000, 3300, 3600] {
+        let ts = base_5m + offset;
+        let slug = format!("btc-updown-5m-{}", ts);
+        
+        let url = format!("https://gamma-api.polymarket.com/markets?slug={}", slug);
+        
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<Vec<GammaMarket>>().await {
+                    Ok(markets) => {
+                        for m in markets {
+                            if let (Some(s), Some(c)) = (m.slug.clone(), m.condition_id.or(m.condition_id_alt)) {
+                                if !c.is_empty() && !result.contains_key(&c) {
+                                    result.insert(c.clone(), s.clone());
+                                    result.insert(c, s);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    Ok(result)
+}
+
+fn update_pipeline_capital_metrics(metrics: &mut PipelineMetrics, bankroll: f64) {
+    metrics.ending_capital = bankroll;
+    if bankroll > metrics.peak_capital {
+        metrics.peak_capital = bankroll;
+    }
+    if metrics.peak_capital > 0.0 {
+        let drawdown = (metrics.peak_capital - bankroll) / metrics.peak_capital;
+        if drawdown > metrics.max_drawdown {
+            metrics.max_drawdown = drawdown;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_pipeline_snapshot(
+    market: &DiscoveredMarket,
+    epoch_seconds: u64,
+    yes_bid: f64,
+    yes_ask: f64,
+    no_bid: f64,
+    no_ask: f64,
+    candle_engine: &mut CandleEngine,
+    ind_1m: &mut IndicatorEngine,
+    ind_5s: &mut IndicatorEngine,
+    signal_engine: &mut SignalEngine,
+    state_1m: &mut IndicatorState,
+    state_5s: &mut IndicatorState,
+    shadow: &mut ShadowPosition,
+    metrics: &mut PipelineMetrics,
+    position_size_usd: f64,
+    verbose: bool,
+) {
+    metrics.total_ticks += 1;
+
+    let dual_snapshot = DualSnapshot {
+        yes: MarketSnapshot {
+            midpoint: Some(Decimal::from_f64_retain((yes_bid + yes_ask) / 2.0).unwrap_or_default()),
+            best_bid: Some(Decimal::from_f64_retain(yes_bid).unwrap_or_default()),
+            best_ask: Some(Decimal::from_f64_retain(yes_ask).unwrap_or_default()),
+            spread: Some(Decimal::from_f64_retain(yes_ask - yes_bid).unwrap_or_default()),
+            top5_bid_depth: Decimal::from(1000),
+            top5_ask_depth: Decimal::from(1000),
+        },
+        no: MarketSnapshot {
+            midpoint: Some(Decimal::from_f64_retain((no_bid + no_ask) / 2.0).unwrap_or_default()),
+            best_bid: Some(Decimal::from_f64_retain(no_bid).unwrap_or_default()),
+            best_ask: Some(Decimal::from_f64_retain(no_ask).unwrap_or_default()),
+            spread: Some(Decimal::from_f64_retain(no_ask - no_bid).unwrap_or_default()),
+            top5_bid_depth: Decimal::from(1000),
+            top5_ask_depth: Decimal::from(1000),
+        },
+    };
+
+    if let Some(step) = run_shadow_strategy_step(
+        &dual_snapshot,
+        &market.slug,
+        &market.slug,
+        market.start_ts,
+        market.end_ts,
+        epoch_seconds,
+        position_size_usd,
+        candle_engine,
+        ind_1m,
+        ind_5s,
+        signal_engine,
+        state_1m,
+        state_5s,
+        shadow,
+    ) {
+        if step.entry_blocked && verbose {
+            println!("[PIPELINE] blocked entry {}", market.condition_id);
+        }
+        if let Some(exit_trade) = step.exit_trade {
+            metrics.trades_taken += 1;
+            if exit_trade.pnl_usd >= 0.0 {
+                metrics.wins += 1;
+            } else {
+                metrics.losses += 1;
+            }
+            update_pipeline_capital_metrics(metrics, shadow.bankroll_usd);
+        }
+    }
+}
+
+async fn run_backtest_pipeline(args: BacktestPipelineArgs) -> Result<()> {
+    let start: DateTime<Utc> = args
+        .start
+        .parse()
+        .context("Invalid start time format. Use ISO format: 2026-03-02T00:00:00Z")?;
+    let end: DateTime<Utc> = args
+        .end
+        .parse()
+        .context("Invalid end time format. Use ISO format: 2026-03-03T00:00:00Z")?;
+
+    if args.top_n.is_some() {
+        eprintln!("[PIPELINE] --top-n is deprecated and ignored in exact-discovery mode");
+    }
+
+    println!("[PIPELINE] Backtest Pipeline");
+    println!("[PIPELINE] Time range: {} to {}", start, end);
+    println!("[PIPELINE] Crypto: {:?}", args.crypto);
+    println!("[PIPELINE] Filter: {}", args.filter);
+    println!("[PIPELINE] Capital: ${:.2}, Size: ${:.2}", args.capital, args.size);
+    println!("[PIPELINE] Entry band: {:.2} - {:.2}", args.band_low, args.band_high);
+
+    let inputs = resolve_pipeline_inputs(args.input.as_deref(), start, end);
+    if let Some(input) = &args.input {
+        println!("[PIPELINE] Using explicit parquet input: {}", input);
+    } else {
+        println!("[PIPELINE] Generated {} hourly URLs", inputs.len());
+    }
+
+    let conn = duckdb::Connection::open_in_memory()
+        .context("Failed to create DuckDB connection")?;
+    conn.execute_batch("INSTALL httpfs; LOAD httpfs;")
+        .context("Failed to load httpfs extension")?;
+    conn.execute_batch("PRAGMA threads=4; PRAGMA memory_limit='4GB';")
+        .context("Failed to set pragmas")?;
+
+    let mut metrics = PipelineMetrics::new(args.capital);
+
+    let mut shadow = ShadowPosition::default();
+    shadow.bankroll_usd = args.capital;
+
+    let mut processed_markets: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let bar = indicatif::ProgressBar::new(inputs.len() as u64);
+    bar.set_style(
+        indicatif::ProgressStyle::default_bar()
+            .template("{spinner} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .unwrap(),
+    );
+
+    for input in &inputs {
+        let hour_str = input
+            .split("orderbook_")
+            .nth(1)
+            .unwrap_or("")
+            .replace(".parquet", "");
+        bar.set_message(format!("Processing {}...", hour_str));
+
+        let discovered = discover_markets_for_input(
+            &conn,
+            input,
+            args.min_ticks,
+            args.crypto,
+            Some(&args.filter),
+            args.verbose,
+        )
+        .await?;
+
+        if discovered.is_empty() {
+            if args.verbose {
+                println!("[PIPELINE] No exact-matched markets found in {}", hour_str);
+            }
+            bar.inc(1);
+            continue;
+        }
+
+        for market in discovered {
+            if market.end_ts < start.timestamp() || market.start_ts > end.timestamp() {
+                continue;
+            }
+
+            if !processed_markets.insert(market.condition_id.clone()) {
+                continue;
+            }
+
+            metrics.total_markets += 1;
+
+            let mut candle_engine = CandleEngine::new();
+            candle_engine.set_debug(false);
+            let mut ind_1m = IndicatorEngine::new();
+            let mut ind_5s = IndicatorEngine::new();
+            let mut signal_engine = SignalEngine::new_with_band(args.band_low, args.band_high);
+            let mut state_1m = IndicatorState::default();
+            let mut state_5s = IndicatorState::default();
+
+            shadow.full_reset();
+
+            let tick_sql = format!(
+                r#"
+                SELECT
+                    CAST(data ->> '$.timestamp' AS DOUBLE) AS ts,
+                    UPPER(data ->> '$.side') AS side,
+                    CAST(data ->> '$.best_bid' AS DOUBLE) AS best_bid,
+                    CAST(data ->> '$.best_ask' AS DOUBLE) AS best_ask
+                FROM read_parquet('{}')
+                WHERE market_id = '{}'
+                ORDER BY ts
+                "#,
+                input, market.condition_id
+            );
+
+            let mut stmt = match conn.prepare(&tick_sql) {
+                Ok(s) => s,
+                Err(err) => {
+                    if args.verbose {
+                        println!(
+                            "[PIPELINE] tick query failed for {} in {}: {}",
+                            market.condition_id, hour_str, err
+                        );
+                    }
+                    continue;
+                }
+            };
+
+            let rows = match stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<f64>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                ))
+            }) {
+                Ok(r) => r,
+                Err(err) => {
+                    if args.verbose {
+                        println!(
+                            "[PIPELINE] tick row mapping failed for {} in {}: {}",
+                            market.condition_id, hour_str, err
+                        );
+                    }
+                    continue;
+                }
+            };
+
+            let mut yes_bid = 0.0_f64;
+            let mut yes_ask = 0.0_f64;
+            let mut no_bid = 0.0_f64;
+            let mut no_ask = 0.0_f64;
+            let mut market_ticks = 0usize;
+            let mut pending_second: Option<u64> = None;
+            let mut pending_yes_bid = 0.0_f64;
+            let mut pending_yes_ask = 0.0_f64;
+            let mut pending_no_bid = 0.0_f64;
+            let mut pending_no_ask = 0.0_f64;
+
+            for row in rows {
+                let (ts, side, best_bid, best_ask) = row?;
+
+                let ts = ts.unwrap_or(0.0);
+                let side = side.unwrap_or_default();
+                let best_bid = best_bid.unwrap_or(0.0);
+                let best_ask = best_ask.unwrap_or(0.0);
+
+                if ts <= 0.0 || best_bid <= 0.0 || best_ask <= 0.0 {
+                    continue;
+                }
+
+                match side.as_str() {
+                    "YES" => {
+                        yes_bid = best_bid;
+                        yes_ask = best_ask;
+                    }
+                    "NO" => {
+                        no_bid = best_bid;
+                        no_ask = best_ask;
+                    }
+                    _ => continue,
+                }
+
+                if yes_bid <= 0.0 || yes_ask <= 0.0 || no_bid <= 0.0 || no_ask <= 0.0 {
+                    continue;
+                }
+
+                market_ticks += 1;
+                let row_second = ts as u64;
+
+                if let Some(prev_second) = pending_second {
+                    if row_second > prev_second {
+                        for sample_second in prev_second..row_second {
+                            process_pipeline_snapshot(
+                                &market,
+                                sample_second,
+                                pending_yes_bid,
+                                pending_yes_ask,
+                                pending_no_bid,
+                                pending_no_ask,
+                                &mut candle_engine,
+                                &mut ind_1m,
+                                &mut ind_5s,
+                                &mut signal_engine,
+                                &mut state_1m,
+                                &mut state_5s,
+                                &mut shadow,
+                                &mut metrics,
+                                args.size,
+                                args.verbose,
+                            );
+                        }
+                    }
+                }
+
+                pending_second = Some(row_second);
+                pending_yes_bid = yes_bid;
+                pending_yes_ask = yes_ask;
+                pending_no_bid = no_bid;
+                pending_no_ask = no_ask;
+            }
+
+            if let Some(prev_second) = pending_second {
+                for sample_second in prev_second..(market.end_ts as u64) {
+                    process_pipeline_snapshot(
+                        &market,
+                        sample_second,
+                        pending_yes_bid,
+                        pending_yes_ask,
+                        pending_no_bid,
+                        pending_no_ask,
+                        &mut candle_engine,
+                        &mut ind_1m,
+                        &mut ind_5s,
+                        &mut signal_engine,
+                        &mut state_1m,
+                        &mut state_5s,
+                        &mut shadow,
+                        &mut metrics,
+                        args.size,
+                        args.verbose,
+                    );
+                }
+            }
+
+           if shadow.is_active() {
+               let side_bid = match shadow.token_side {
+                   Some(TokenSide::Yes) => yes_bid,
+                   Some(TokenSide::No) => no_bid,
+                   None => shadow.entry_price,
+               };
+               let settlement_price = if side_bid > 0.5 { 1.0 } else { 0.0 };
+               let final_pnl = shadow.pnl(settlement_price);
+               let realized = final_pnl * shadow.size;
+               shadow.realized_pnl += realized;
+               shadow.position_realized_pnl += realized;
+               let dollar_pnl = final_pnl * shadow.position_size_usd;
+               shadow.bankroll_usd += shadow.position_size_usd + dollar_pnl;
+               shadow.realized_usd += dollar_pnl;
+               shadow.position_realized_usd += dollar_pnl;
+               metrics.trades_taken += 1;
+               if dollar_pnl >= 0.0 {
+                   metrics.wins += 1;
+               } else {
+                   metrics.losses += 1;
+               }
+               if args.verbose {
+                   println!(
+                       "[SETTLEMENT] {} | {:?} @ {:.4} -> {:.4} | ${:.2}",
+                       market.slug,
+                       shadow.token_side,
+                       shadow.entry_price,
+                       settlement_price,
+                       dollar_pnl
+                   );
+               }
+               shadow.reset(market.end_ts as u64);
+               update_pipeline_capital_metrics(&mut metrics, shadow.bankroll_usd);
+           }
+           shadow.full_reset();
+           if args.verbose {
+               println!(
+                   "[PIPELINE] completed {} | {} ticks",
+                   market.condition_id, market_ticks
+               );
+           }
+       }
+       bar.inc(1);
+   }
+   bar.finish_with_message("Done");
+   metrics.ending_capital = shadow.bankroll_usd;
+   metrics.total_pnl = metrics.ending_capital - metrics.starting_capital;
+   metrics.total_pnl_pct = if metrics.starting_capital.abs() > f64::EPSILON {
+       (metrics.total_pnl / metrics.starting_capital) * 100.0
+   } else {
+       0.0
+   };
+   update_pipeline_capital_metrics(&mut metrics, shadow.bankroll_usd);
+   metrics.print_summary();
+   if let Some(export_path) = &args.export {
+       let export_data = serde_json::json!({
+           "total_ticks": metrics.total_ticks,
+           "total_markets": metrics.total_markets,
+           "trades_taken": metrics.trades_taken,
+           "wins": metrics.wins,
+           "losses": metrics.losses,
+           "win_rate": if metrics.trades_taken > 0 { metrics.wins as f64 / metrics.trades_taken as f64 } else { 0.0 },
+           "starting_capital": metrics.starting_capital,
+           "ending_capital": metrics.ending_capital,
+           "total_pnl": metrics.total_pnl,
+           "total_pnl_pct": metrics.total_pnl_pct,
+           "max_drawdown": metrics.max_drawdown,
+       });
+       std::fs::write(export_path, serde_json::to_string_pretty(&export_data)?)
+           .context("Failed to write export file")?;
+       println!("[PIPELINE] Results exported to {}", export_path);
+   }
+   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_timestamps_are_5m_aligned() {
+        let stamps = candidate_slug_timestamps(1_772_188_821);
+        assert_eq!(stamps.len(), 7);
+        assert!(stamps.into_iter().all(|ts| ts % FIVE_MINUTES_SECONDS == 0));
+    }
+
+    #[test]
+    fn detects_known_btc_updown_slug_prefix() {
+        assert!("btc-updown-5m-1772187900".starts_with(BTC_UPDOWN_SLUG_PREFIX));
+    }
+
+    #[test]
+    fn question_matcher_handles_variants() {
+        assert!(is_btc_up_down_5m("BTC Up or Down in 5m?"));
+        assert!(is_btc_up_down_5m(
+            "Bitcoin up/down over next 5-minute candle"
+        ));
+        assert!(!is_btc_up_down_5m("ETH Up or Down in 5m?"));
+    }
+
+    #[test]
+    fn updown_5m_text_matcher_requires_both_parts() {
+        assert!(is_updown_5m_text("bitcoin up or down in 5m"));
+        assert!(is_updown_5m_text("eth up/down over next 5-minute candle"));
+        assert!(!is_updown_5m_text("bitcoin direction in 5m"));
+        assert!(!is_updown_5m_text("bitcoin up or down soon"));
+    }
+
+    #[test]
+    fn crypto_text_matcher_detects_requested_asset() {
+        assert!(matches_crypto_text("bitcoin up or down in 5m", CryptoAsset::Btc));
+        assert!(matches_crypto_text("ethereum up or down in 5m", CryptoAsset::Eth));
+        assert!(!matches_crypto_text("ethereum up or down in 5m", CryptoAsset::Btc));
+    }
+
+    #[test]
+    fn window_overlap_uses_half_open_hour_range() {
+        let hour = 1_772_514_000; // 05:00:00 UTC
+        assert!(window_overlaps_hour(hour, hour + 300, hour));
+        assert!(window_overlaps_hour(hour + 3300, hour + 3600, hour));
+        assert!(!window_overlaps_hour(hour - 300, hour, hour));
+    }
+
+    #[test]
+    fn btc_updown_label_uses_et_question_window() {
+        let label =
+            btc_updown_label_from_question("Bitcoin Up or Down - February 27, 5:45AM-5:50AM ET");
+        assert_eq!(label, "BTC 5m February 27, 5:45AM-5:50AM ET");
+    }
+
+    #[test]
+    fn trade_allowed_passes_good_conditions() {
+        let snapshot = MarketSnapshot {
+            midpoint: Some(Decimal::new(50, 2)),
+            best_bid: Some(Decimal::new(47, 2)),
+            best_ask: Some(Decimal::new(50, 2)),
+            spread: Some(Decimal::new(3, 2)),
+            top5_bid_depth: Decimal::new(50000, 2),
+            top5_ask_depth: Decimal::new(50000, 2),
+        };
+        // yes_ask=0.50, no_ask=0.50, sum=1.0, passes complement
+        assert!(trade_allowed(&snapshot, 60, 30, 0.50, 0.50).is_ok());
+    }
+
+    #[test]
+    fn trade_allowed_blocks_wide_spread() {
+        let snapshot = MarketSnapshot {
+            midpoint: Some(Decimal::new(50, 2)),
+            best_bid: Some(Decimal::new(40, 2)),
+            best_ask: Some(Decimal::new(60, 2)),
+            spread: Some(Decimal::new(20, 2)),
+            top5_bid_depth: Decimal::new(50000, 2),
+            top5_ask_depth: Decimal::new(50000, 2),
+        };
+        assert_eq!(trade_allowed(&snapshot, 60, 30, 0.60, 0.40), Err(FilterReason::WideSpread));
+    }
+
+    #[test]
+    fn trade_allowed_blocks_extreme_price() {
+        let snapshot = MarketSnapshot {
+            midpoint: Some(Decimal::new(85, 2)),
+            best_bid: Some(Decimal::new(84, 2)),
+            best_ask: Some(Decimal::new(86, 2)),
+            spread: Some(Decimal::new(2, 2)),
+            top5_bid_depth: Decimal::new(50000, 2),
+            top5_ask_depth: Decimal::new(50000, 2),
+        };
+        assert_eq!(trade_allowed(&snapshot, 60, 30, 0.86, 0.14), Err(FilterReason::ExtremePrice));
+    }
+
+    #[test]
+    fn trade_allowed_blocks_broken_book() {
+        let snapshot = MarketSnapshot {
+            midpoint: Some(Decimal::new(50, 2)),
+            best_bid: Some(Decimal::new(49, 2)),
+            best_ask: Some(Decimal::new(51, 2)),
+            spread: Some(Decimal::new(2, 2)),
+            top5_bid_depth: Decimal::new(50000, 2),
+            top5_ask_depth: Decimal::new(50000, 2),
+        };
+        // YES=0.99, NO=0.99, sum=1.98 - broken book
+        assert_eq!(trade_allowed(&snapshot, 60, 30, 0.99, 0.99), Err(FilterReason::BrokenBook));
+    }
+}
+
+
+

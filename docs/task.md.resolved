@@ -1,0 +1,53 @@
+# Engine Refactor — Task Tracker
+
+## Phase 1: Extract Discovery Module from bot.rs
+- [x] Create [src/bot/discovery/mod.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs) with [DiscoveredMarket](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2211-2221), [WatchedMarket](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs#34-42), [ResolvedSlugMarket](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/pipeline/mod.rs#290-297)
+- [x] Move discovery functions: [discover_market_loop](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1307-1324), [discover_active_btc_market](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs#157-181), [discover_by_time_slugs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1318-1342), [candidate_slug_timestamps](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs#119-126), [search_candidates](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs#127-140), [list_open_market_candidates](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1365-1369), [is_btc_updown_slug_or_question](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs#146-153), [is_btc_up_down_5m](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs#242-252), [is_active_now](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs#253-262), [market_to_watched](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1399-1417), [select_binary_tokens](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs#194-226), [market_label](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1533-1559), [btc_updown_label_from_question](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs#342-348)
+- [x] Move slug/market utility functions: [hour_btc_5m_slugs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2335-2343), [gamma_market_condition_id_hex](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2312-2318), [resolve_btc_hour_slug_markets](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2351-2394), [is_updown_5m_text](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2395-2401), [matches_crypto_text](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2402-2414), [has_binary_directional_tokens](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2415-2432), [parse_slug_timestamp](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs#736-743), [infer_market_window](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs#744-755), [window_overlaps_hour](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs#756-760), [market_matches_exact_filter](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2458-2487), [discover_markets_for_input](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2456-2616)
+- [x] Move `CryptoAsset` enum and [ListMarketsArgs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs#111-136)/[ListMarketsOutput](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/pipeline/mod.rs#299-307)
+- [x] Move tests for slug/market matching
+- [x] Update [bot.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs) imports to use new module
+- [x] Verify `cargo test` passes
+- [x] Verify `cargo build` succeeds
+
+## Phase 2: Extract Execution Module from bot.rs
+- [x] Create [src/bot/execution.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/execution.rs) with [LivePosition](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/execution.rs#27-37), [OrderResult](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1259-1263), [PendingSettlement](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#269-280)
+- [x] Move execution functions: [handle_live_signals](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1022-1201), [place_market_buy](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1168-1193), [place_market_sell](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1260-1290), [get_usdc_balance](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1296-1306), [try_settle_pending](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#910-1021)
+- [x] Update [bot.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs) imports
+- [x] Verify `cargo test` passes
+- [x] Verify `cargo build` succeeds
+
+## Phase 3: Extract Pipeline Module from bot.rs
+- [x] Create [src/bot/pipeline/mod.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/pipeline/mod.rs) with [OrderbookTick](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2676-2685), [MarketState](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/pipeline/mod.rs#319-326), [PipelineMetrics](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2703-2716)
+- [x] Move pipeline functions: [run_backtest_pipeline](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2941-3255), [process_pipeline_snapshot](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/pipeline/mod.rs#1727-1797), [update_pipeline_capital_metrics](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2857-2869), [resolve_pipeline_inputs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/pipeline/mod.rs#391-402), [generate_hourly_urls](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1123-1138), [fetch_condition_ids_for_hour](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2783-2824), [load_parquet_market_stats](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2209-2250), [load_parquet_market_stats_for_ids](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs#586-637)
+- [x] Move [run_list_markets](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/pipeline/mod.rs#1071-1128), [run_extract_midpoints](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1955-2099), [run_inspect_parquet](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2100-2201)
+- [x] Move related CLI arg structs
+- [x] Update [bot.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs) imports
+- [x] Verify `cargo test` passes
+- [x] Verify `cargo build` succeeds
+
+## Phase 4: Add Risk Gatekeeper (inspired by boooot)
+- [ ] Expand [src/bot/risk.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/risk.rs) with `GateDecision` enum, `GatekeeperState` struct
+- [ ] Add daily loss limit circuit breaker
+- [ ] Add emergency halt flag
+- [ ] Add cooldown tracking
+- [ ] Wire gatekeeper into [watch_btc_market](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#292-599) and [trade_btc_live](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#665-875)
+- [ ] Add unit tests for gate decisions
+- [ ] Verify `cargo test` passes
+
+## Phase 5: Add Structured Event Logging
+- [ ] Expand [src/bot/logging.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/logging.rs) with typed `EngineEvent` enum
+- [ ] Add separate JSONL log channels: market, strategy, execution
+- [ ] Wire event logging into strategy runner and gatekeeper
+- [ ] Verify log output on a short live session
+
+## Phase 6: Feed Normalization + WebSocket Live Feed
+- [ ] Ensure [BookDeltaEvent](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/feed.rs#43-57) and [DualSnapshot](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/feed.rs#69-74) are the single source of truth
+- [ ] Make [watch_btc_market](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#292-599) consume [MarketWebsocketFeed](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/feed.rs#159-163) events instead of REST polling
+- [ ] Add `StrategyInputSource` trait for live/replay parity
+- [ ] Verify live `watch-btc` works with WebSocket feed
+
+## Phase 7: Event-by-Event Backtest Replay
+- [ ] Add `ReplayMode` enum (EventByEvent, LiveParity1s)
+- [ ] Implement event-by-event parquet row replay
+- [ ] Verify backtest parity between modes

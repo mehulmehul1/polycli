@@ -1,0 +1,300 @@
+# Engine Refactor — Implementation Plan
+
+Decompose the 3,368-line [bot.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs) into focused engine modules, then layer on gatekeeper, event logging, WebSocket feed, and event-by-event replay — carrying forward the best architecture ideas from `boooot_compare_2`.
+
+> [!IMPORTANT]
+> Each phase is a standalone, compilable checkpoint. We never break `cargo build` or `cargo test` mid-phase.
+
+---
+
+## Phase 1: Extract Discovery Module
+
+**Goal:** Move all market discovery, slug parsing, and market matching code out of [bot.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs) into `src/bot/discovery/`.
+
+### [NEW] [mod.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/discovery/mod.rs)
+
+New module containing:
+
+**Structs to move:**
+- `CryptoAsset` enum (line ~39)
+- [WatchedMarket](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#327-335) struct (line ~327)
+- [DiscoveredMarket](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2211-2221) struct (line ~2211)
+- [ResolvedSlugMarket](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2223-2230) struct (line ~2223)
+- [ListMarketsArgs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#97-122), [ListMarketsOutput](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2232-2240) structs
+- [GammaMarket](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1831-1838), [MidpointRow](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1840-1848) structs
+
+**Functions to move (~20):**
+- [discover_market_loop](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1307-1324) (line 1307–1323)
+- [discover_active_btc_market](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1325-1349) (line 1325–1348)
+- [discover_by_time_slugs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1350-1374) (line 1350–1373)
+- [candidate_slug_timestamps](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1375-1382) (line 1375–1381)
+- [search_candidates](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1383-1396) (line 1383–1395)
+- [list_open_market_candidates](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1397-1401) (line 1397–1400)
+- [is_btc_updown_slug_or_question](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1402-1409) (line 1402–1408)
+- [is_btc_up_down_5m](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1410-1420) (line 1410–1419)
+- [is_active_now](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1421-1430) (line 1421–1429)
+- [market_to_watched](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1431-1449) (line 1431–1448)
+- [select_binary_tokens](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1450-1482) (line 1450–1481)
+- [market_label](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1565-1591) (line 1565–1590)
+- [btc_updown_label_from_question](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1592-1598) (line 1592–1597)
+- [hour_btc_5m_slugs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2335-2343) (line 2335–2342)
+- [gamma_market_condition_id_hex](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2344-2350) (line 2344–2349)
+- [resolve_btc_hour_slug_markets](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2351-2394) (line 2351–2393)
+- [is_updown_5m_text](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2395-2401) (line 2395–2400)
+- [matches_crypto_text](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2402-2414) (line 2402–2413)
+- [has_binary_directional_tokens](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2415-2432) (line 2415–2431)
+- [parse_slug_timestamp](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2433-2440) (line 2433–2439)
+- [infer_market_window](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2441-2452) (line 2441–2451)
+- [window_overlaps_hour](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2453-2457) (line 2453–2456)
+- [market_matches_exact_filter](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2458-2487) (line 2458–2486)
+
+**Tests to move:**
+- [candidate_timestamps_are_5m_aligned](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3260-3266)
+- [detects_known_btc_updown_slug_prefix](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3267-3271)
+- [question_matcher_handles_variants](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3272-3280)
+- [updown_5m_text_matcher_requires_both_parts](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3281-3288)
+- [crypto_text_matcher_detects_requested_asset](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3289-3295)
+- [window_overlap_uses_half_open_hour_range](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3296-3303)
+- [btc_updown_label_uses_et_question_window](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3304-3310)
+
+### [MODIFY] [bot.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs)
+
+Replace moved code with `use crate::bot::discovery::*` imports. [bot.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs) should shrink by ~600–800 lines.
+
+### [MODIFY] [mod.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/mod.rs)
+
+Add `pub mod discovery;`
+
+---
+
+## Phase 2: Extract Execution Module
+
+**Goal:** Move live trade execution code into `src/bot/execution.rs`.
+
+### [NEW] [execution.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/execution.rs)
+
+**Structs to move:**
+- [LivePosition](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#673-683) (line ~673)
+- [OrderResult](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1291-1295) (line ~1291)
+- [PendingSettlement](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#336-347) (line ~336)
+
+**Functions to move:**
+- [handle_live_signals](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1054-1233) (line 1054–1232)
+- [place_market_buy](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1234-1259) (line 1234–1258)
+- [place_market_sell](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1260-1290) (line 1260–1289)
+- [get_usdc_balance](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1296-1306) (line 1296–1305)
+- [try_settle_pending](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#942-1053) (line 942–1052)
+
+**Tests to move:**
+- [trade_allowed_passes_good_conditions](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3311-3324)
+- [trade_allowed_blocks_wide_spread](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3325-3337)
+- [trade_allowed_blocks_extreme_price](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3338-3350)
+- [trade_allowed_blocks_broken_book](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3351-3364)
+
+### [MODIFY] [bot.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs)
+
+Replace with imports. [bot.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs) should shrink by another ~400 lines.
+
+---
+
+## Phase 3: Extract Pipeline Module
+
+**Goal:** Move backtest pipeline, parquet inspection, and data utility code into `src/bot/pipeline/`.
+
+### [NEW] [mod.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/pipeline/mod.rs)
+
+**Structs to move:**
+- [OrderbookTick](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2708-2717), [MarketState](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2718-2734), [PipelineMetrics](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2735-2748), [ParquetMarketStat](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2203-2209)
+- [BacktestPipelineArgs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#124-189), [InspectParquetArgs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#191-208), [ExtractMidpointsArgs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#309-326), [FetchPmxtArgs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#286-307)
+
+**Functions to move:**
+- [run_backtest_pipeline](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2941-3255) (line 2941–3254) — the 300-line pipeline
+- [process_pipeline_snapshot](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2870-2940) (line 2870–2939)
+- [update_pipeline_capital_metrics](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2857-2869) (line 2857–2868)
+- [resolve_pipeline_inputs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2804-2814) (line 2804–2813)
+- [generate_hourly_urls](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2788-2803) (line 2788–2802)
+- [fetch_condition_ids_for_hour](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2815-2856) (line 2815–2855)
+- [load_parquet_market_stats](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2241-2282) (line 2241–2281)
+- [load_parquet_market_stats_for_ids](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2283-2334) (line 2283–2333)
+- [discover_markets_for_input](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2488-2648) (line 2488–2647)
+- [run_list_markets](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2649-2706) (line 2649–2705)
+- [run_extract_midpoints](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1955-2099) (line 1955–2098)
+- [run_inspect_parquet](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#2100-2201) (line 2100–2200)
+- [run_fetch_pmxt](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1752-1829) (line 1752–1828)
+- [probe_btc_updown_slugs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1863-1907) (line 1863–1906)
+- [fetch_btc_condition_ids](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1908-1954) (line 1908–1953)
+
+### [MODIFY] [bot.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs)
+
+After Phase 3, [bot.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs) should contain only:
+- [BotArgs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#52-56), `BotCommand` enum — CLI orchestration
+- [execute()](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#348-364) — dispatches to subcommands
+- [watch_btc_market()](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#365-672) — live shadow loop (~300 lines)
+- [trade_btc_live()](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#732-941) — live trading loop (~200 lines)
+- [run_backtest()](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1603-1656), [run_monte_carlo()](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1657-1706), [run_parameter_sweep()](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1707-1751) — thin wrappers
+
+Target: **~800 lines** (down from 3,368).
+
+---
+
+## Phase 4: Add Risk Gatekeeper
+
+**Goal:** Separate signal generation from trade permission. Inspired by `boooot`'s [Gatekeeper](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/tmp/boooot_compare_2/trading_system/trading_system/gatekeeper/gatekeeper.py#20-301).
+
+### [MODIFY] [risk.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/risk.rs)
+
+Add:
+
+```rust
+#[derive(Debug, Clone, Serialize)]
+pub enum GateDecision {
+    Approved { reason: String },
+    Blocked { reason: FilterReason },
+}
+
+pub struct Gatekeeper {
+    emergency_halt: bool,
+    daily_loss_limit: f64,
+    daily_pnl: f64,
+    trading_date: Option<chrono::NaiveDate>,
+    cooldown_until: Option<u64>,
+    // ... existing filter config
+}
+
+impl Gatekeeper {
+    pub fn check_entry(&mut self, snapshot: &MarketSnapshot, ...) -> GateDecision;
+    pub fn record_trade_result(&mut self, pnl: f64);
+    pub fn halt(&mut self);
+    pub fn clear_halt(&mut self);
+}
+```
+
+Key features ported from `boooot`:
+- Daily loss limit auto-halt (the most valuable feature)
+- Emergency kill switch
+- Cooldown after loss
+- All existing [trade_allowed](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/risk.rs#36-73) checks preserved
+
+---
+
+## Phase 5: Structured Event Logging
+
+**Goal:** Typed event logging for replay determinism and debugging.
+
+### [MODIFY] [logging.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/logging.rs)
+
+Add `EngineEvent` enum (for logging/observability only, **not** a runtime event bus):
+
+```rust
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+pub enum EngineEvent {
+    BookUpdate { ts: u64, yes_bid: f64, yes_ask: f64, no_bid: f64, no_ask: f64 },
+    StrategySignal { ts: u64, entry: String, exit: String, midpoint: f64 },
+    GateDecision { ts: u64, decision: String, reason: String },
+    ShadowEntry { ts: u64, side: String, price: f64, size: f64 },
+    ShadowExit { ts: u64, pnl: f64, bankroll: f64 },
+    EmergencyHalt { ts: u64, daily_pnl: f64 },
+}
+```
+
+Separate JSONL log files: `market_events.jsonl`, `strategy_events.jsonl`, `execution_events.jsonl`.
+
+---
+
+## Phase 6: Feed Normalization + WebSocket Live Feed
+
+**Goal:** Make [watch_btc_market](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#365-672) event-driven via WebSocket instead of REST polling.
+
+### [MODIFY] [feed.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/feed.rs)
+
+[MarketWebsocketFeed](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/feed.rs#159-163) already exists and works. Changes needed:
+- Remove [fetch_snapshot](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#1483-1564) REST polling from [watch_btc_market](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#365-672)
+- Consume [BookDeltaEvent](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/feed.rs#43-57) from the WebSocket feed directly
+- Add `StrategyInputSource` trait:
+
+```rust
+pub trait StrategyInputSource {
+    fn next_event(&mut self) -> Option<BookDeltaEvent>;
+    fn current_time(&self) -> u64;
+}
+```
+
+### [MODIFY] [bot.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs)
+
+Rewrite [watch_btc_market](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#365-672) loop to consume `StrategyInputSource` instead of REST polling.
+
+---
+
+## Phase 7: Event-by-Event Backtest Replay
+
+**Goal:** True historical replay at event granularity.
+
+### [NEW] [replay.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/replay.rs)
+
+```rust
+pub enum ReplayMode {
+    EventByEvent,
+    LiveParity1s,
+}
+```
+
+Implement `StrategyInputSource` for parquet row iteration. Same strategy runner handles both live and replay.
+
+---
+
+## Verification Plan
+
+### Automated Tests (after each phase)
+
+```powershell
+# Run after every phase — must pass
+cargo test --all
+```
+
+Existing tests that validate discovery logic:
+- [candidate_timestamps_are_5m_aligned](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3260-3266)
+- [detects_known_btc_updown_slug_prefix](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3267-3271)
+- [question_matcher_handles_variants](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3272-3280)
+- [updown_5m_text_matcher_requires_both_parts](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3281-3288)
+- [crypto_text_matcher_detects_requested_asset](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3289-3295)
+- [window_overlap_uses_half_open_hour_range](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3296-3303)
+- [btc_updown_label_uses_et_question_window](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3304-3310)
+
+Existing tests that validate risk logic:
+- [trade_allowed_passes_good_conditions](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3311-3324)
+- [trade_allowed_blocks_wide_spread](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3325-3337)
+- [trade_allowed_blocks_extreme_price](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3338-3350)
+- [trade_allowed_blocks_broken_book](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#3351-3364)
+
+Existing tests in bot submodules:
+- [candles.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/candles.rs) tests (5s boundary, invalid prices, volume modes)
+- [indicators.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/indicators.rs) tests (breakout, fake breakout, compression, flat market)
+- [signal.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/signal.rs) tests (long entry, short entry, slope flip exit, probability range)
+
+### New Tests to Add
+
+**Phase 4 (Gatekeeper):**
+- `gatekeeper_blocks_after_daily_loss_limit`
+- `gatekeeper_allows_normal_entry`
+- `gatekeeper_emergency_halt_blocks_all`
+- `gatekeeper_cooldown_blocks_then_expires`
+
+### Build Verification
+
+```powershell
+# Full release build — must succeed
+cargo build --release 2>&1
+```
+
+### Functional Smoke Test (after Phases 1-3)
+
+```powershell
+# Verify CLI still works — should print help
+cargo run -- bot --help
+```
+
+```powershell
+# Verify list-markets works (no wallet needed)
+cargo run -- bot list-markets --input pmxtarchives --crypto btc --limit 3
+```

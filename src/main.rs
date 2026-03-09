@@ -3,6 +3,7 @@ mod bot;
 mod commands;
 mod config;
 mod output;
+mod persistence;
 mod shell;
 
 use std::process::ExitCode;
@@ -71,6 +72,9 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
     let cli = Cli::parse();
     let output = cli.output;
 
@@ -88,6 +92,7 @@ async fn main() -> ExitCode {
 
     ExitCode::SUCCESS
 }
+
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
