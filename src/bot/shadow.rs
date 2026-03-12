@@ -1,7 +1,11 @@
 use serde::Serialize;
 
 use crate::bot::feed::DualSnapshot;
-use crate::bot::risk::{best_ask_price, best_bid_price, trade_allowed};
+use crate::bot::logging::{EngineEvent, EngineEventLoggers};
+use crate::bot::risk::{
+    best_ask_price, best_bid_price, EntryContext, FilterReason, GateDecision, GatekeeperState,
+    TradeDirection,
+};
 use crate::bot::signal::{EntrySignal, ExitSignal, SignalState};
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -117,6 +121,8 @@ pub fn handle_shadow_signals(
     signal: &mut SignalState,
     dual_snapshot: &DualSnapshot,
     shadow: &mut ShadowPosition,
+    gatekeeper: &mut GatekeeperState,
+    event_loggers: Option<&EngineEventLoggers>,
     market_label: &str,
     market_slug: &str,
     market_start_ts: i64,
@@ -134,52 +140,76 @@ pub fn handle_shadow_signals(
     let contract_age = (timestamp as i64) - market_start_ts;
 
     if signal.entry != EntrySignal::None && !shadow.is_active() {
-        if !(30..=280).contains(&time_remaining) {
-            println!("[FILTER BLOCKED] Time remaining {}s is outside 30s-280s window", time_remaining);
-            return result;
-        }
-
-        if timestamp.saturating_sub(shadow.last_exit_timestamp) < 15 {
-            println!("[FILTER BLOCKED] Cooldown active (last exit was < 15s ago)");
-            return result;
-        }
-
-        match signal.entry {
-            EntrySignal::Long if shadow.yes_blocked => {
-                println!("[BLOCKED] YES direction locked after loss");
-                result.entry_blocked = true;
-                return result;
-            }
-            EntrySignal::Short if shadow.no_blocked => {
-                println!("[BLOCKED] NO direction locked after loss");
-                result.entry_blocked = true;
-                return result;
-            }
-            _ => {}
-        }
-
         let position_size_usd = if shadow.position_size_usd > 0.0 {
             shadow.position_size_usd
         } else {
             1.0
         };
 
-        if shadow.bankroll_usd < position_size_usd {
-            println!("[BANKROLL BLOCKED] ${:.2}", shadow.bankroll_usd);
-            result.entry_blocked = true;
-            return result;
-        }
-
         let snapshot_side = match signal.entry {
             EntrySignal::Long => &dual_snapshot.yes,
             EntrySignal::Short => &dual_snapshot.no,
             EntrySignal::None => return result,
         };
+        let direction = match signal.entry {
+            EntrySignal::Long => TradeDirection::Yes,
+            EntrySignal::Short => TradeDirection::No,
+            EntrySignal::None => return result,
+        };
+        let direction_locked = match signal.entry {
+            EntrySignal::Long => shadow.yes_blocked,
+            EntrySignal::Short => shadow.no_blocked,
+            EntrySignal::None => false,
+        };
 
         let yes_ask = best_ask_price(&dual_snapshot.yes).unwrap_or(0.0);
         let no_ask = best_ask_price(&dual_snapshot.no).unwrap_or(0.0);
 
-        if let Err(reason) = trade_allowed(snapshot_side, time_remaining, contract_age, yes_ask, no_ask) {
+        let decision = gatekeeper.check_entry(
+            snapshot_side,
+            &EntryContext {
+                timestamp,
+                time_remaining,
+                min_time_remaining: 30,
+                max_time_remaining: 280,
+                contract_age,
+                yes_ask,
+                no_ask,
+                bankroll_available: shadow.bankroll_usd,
+                position_size_usd,
+                direction_locked,
+                direction,
+            },
+        );
+
+        if let Some(loggers) = event_loggers {
+            match &decision {
+                GateDecision::Approved { reason } => loggers.log_strategy(EngineEvent::GateDecision {
+                    ts: timestamp,
+                    market_slug: market_slug.to_string(),
+                    decision: "approved".to_string(),
+                    reason: reason.clone(),
+                }),
+                GateDecision::Blocked { reason } => {
+                    loggers.log_strategy(EngineEvent::GateDecision {
+                        ts: timestamp,
+                        market_slug: market_slug.to_string(),
+                        decision: "blocked".to_string(),
+                        reason: format!("{reason:?}"),
+                    });
+                    if matches!(reason, FilterReason::EmergencyHalt | FilterReason::DailyLossLimit) {
+                        loggers.log_execution(EngineEvent::EmergencyHalt {
+                            ts: timestamp,
+                            market_slug: market_slug.to_string(),
+                            daily_pnl: gatekeeper.daily_pnl,
+                            reason: format!("{reason:?}"),
+                        });
+                    }
+                }
+            }
+        }
+
+        if let GateDecision::Blocked { reason } = decision {
             println!(
                 "[FILTER BLOCKED ENTRY] {} | {} Side | Reason: {:?}",
                 market_slug,
@@ -228,6 +258,16 @@ pub fn handle_shadow_signals(
                     "[ENTRY] {} | {} @ {:.4} (mid={:.4}) | Bankroll: ${:.2}",
                     market_label, side_name, price, midpoint, shadow.bankroll_usd
                 );
+                if let Some(loggers) = event_loggers {
+                    loggers.log_execution(EngineEvent::ShadowEntry {
+                        ts: timestamp,
+                        market_slug: market_slug.to_string(),
+                        side: side_name.to_string(),
+                        price,
+                        size_usd: position_size_usd,
+                        bankroll_after: shadow.bankroll_usd,
+                    });
+                }
             }
             _ => {
                 println!("[NO LIQUIDITY] No best_ask for {:?}", shadow.token_side);
@@ -279,6 +319,29 @@ pub fn handle_shadow_signals(
                     shadow.position_realized_usd,
                     shadow.bankroll_usd
                 );
+                gatekeeper.record_trade_result(timestamp, shadow.position_realized_usd);
+                if let Some(loggers) = event_loggers {
+                    loggers.log_execution(EngineEvent::ShadowExit {
+                        ts: timestamp,
+                        market_slug: market_slug.to_string(),
+                        side: result
+                            .exit_trade
+                            .as_ref()
+                            .map(|trade| trade.side.clone())
+                            .unwrap_or_else(|| "N/A".to_string()),
+                        price,
+                        pnl_usd: shadow.position_realized_usd,
+                        bankroll_after: shadow.bankroll_usd,
+                    });
+                    if gatekeeper.emergency_halt {
+                        loggers.log_execution(EngineEvent::EmergencyHalt {
+                            ts: timestamp,
+                            market_slug: market_slug.to_string(),
+                            daily_pnl: gatekeeper.daily_pnl,
+                            reason: "daily loss limit".to_string(),
+                        });
+                    }
+                }
                 shadow.reset(timestamp);
             }
             _ => {

@@ -1,12 +1,15 @@
 use anyhow::Result;
 use clap::ValueEnum;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{future::BoxFuture, SinkExt, StreamExt};
+use polymarket_client_sdk::clob;
 use polymarket_client_sdk::types::{Decimal, U256};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::bot::discovery::fetch_snapshot;
 use crate::bot::logging::JsonlEventLogger;
 
 const CLOB_MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -14,8 +17,10 @@ const CLOB_MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReplayMode {
-    Event,
-    LiveParity,
+    #[value(alias = "event")]
+    EventByEvent,
+    #[value(alias = "live-parity")]
+    LiveParity1s,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ValueEnum)]
@@ -156,6 +161,50 @@ impl MarketSnapshot {
     }
 }
 
+pub trait StrategyInputSource {
+    fn next_snapshot<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<DualSnapshot>>>;
+    fn current_time(&self) -> Option<u64>;
+}
+
+pub struct PollingSnapshotSource<'a> {
+    client: &'a clob::Client,
+    yes_token_id: U256,
+    no_token_id: U256,
+    last_ts: Option<u64>,
+}
+
+impl<'a> PollingSnapshotSource<'a> {
+    #[must_use]
+    pub fn new(client: &'a clob::Client, yes_token_id: U256, no_token_id: U256) -> Self {
+        Self {
+            client,
+            yes_token_id,
+            no_token_id,
+            last_ts: None,
+        }
+    }
+}
+
+impl StrategyInputSource for PollingSnapshotSource<'_> {
+    fn next_snapshot<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<DualSnapshot>>> {
+        Box::pin(async move {
+            let yes_snapshot = fetch_snapshot(self.client, self.yes_token_id).await?;
+            let no_snapshot = fetch_snapshot(self.client, self.no_token_id).await?;
+            let ts = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+            self.last_ts = Some(ts.floor() as u64);
+            Ok(Some(DualSnapshot {
+                yes: yes_snapshot,
+                no: no_snapshot,
+                ts_exchange: ts,
+            }))
+        })
+    }
+
+    fn current_time(&self) -> Option<u64> {
+        self.last_ts
+    }
+}
+
 pub struct MarketWebsocketFeed {
     rx: mpsc::UnboundedReceiver<BookDeltaEvent>,
     join_handle: tokio::task::JoinHandle<()>,
@@ -237,6 +286,122 @@ impl MarketWebsocketFeed {
     pub async fn shutdown(self) {
         self.join_handle.abort();
         let _ = self.join_handle.await;
+    }
+}
+
+pub struct WebsocketSnapshotSource {
+    feed: MarketWebsocketFeed,
+    book_state: DualBookState,
+    last_ts: Option<u64>,
+}
+
+impl WebsocketSnapshotSource {
+    pub async fn connect(
+        market_id: Option<String>,
+        yes_token_id: U256,
+        no_token_id: U256,
+        logger: Option<JsonlEventLogger>,
+    ) -> Result<Self> {
+        Ok(Self {
+            feed: MarketWebsocketFeed::connect(market_id, yes_token_id, no_token_id, logger).await?,
+            book_state: DualBookState::default(),
+            last_ts: None,
+        })
+    }
+
+    pub async fn shutdown(self) {
+        self.feed.shutdown().await;
+    }
+}
+
+impl StrategyInputSource for WebsocketSnapshotSource {
+    fn next_snapshot<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<DualSnapshot>>> {
+        Box::pin(async move {
+            while let Some(event) = self.feed.try_recv() {
+                self.book_state.apply(&event);
+            }
+            let snapshot = self.book_state.snapshot();
+            self.last_ts = snapshot.as_ref().map(|item| item.ts_exchange.floor() as u64);
+            Ok(snapshot)
+        })
+    }
+
+    fn current_time(&self) -> Option<u64> {
+        self.last_ts
+    }
+}
+
+pub enum LiveStrategyInputSource<'a> {
+    Poll(PollingSnapshotSource<'a>),
+    Websocket(WebsocketSnapshotSource),
+}
+
+impl<'a> LiveStrategyInputSource<'a> {
+    #[must_use]
+    pub fn poll(client: &'a clob::Client, yes_token_id: U256, no_token_id: U256) -> Self {
+        Self::Poll(PollingSnapshotSource::new(client, yes_token_id, no_token_id))
+    }
+
+    pub async fn websocket(
+        market_id: Option<String>,
+        yes_token_id: U256,
+        no_token_id: U256,
+        logger: Option<JsonlEventLogger>,
+    ) -> Result<Self> {
+        Ok(Self::Websocket(
+            WebsocketSnapshotSource::connect(market_id, yes_token_id, no_token_id, logger).await?,
+        ))
+    }
+
+    pub async fn shutdown(self) {
+        if let Self::Websocket(source) = self {
+            source.shutdown().await;
+        }
+    }
+}
+
+impl StrategyInputSource for LiveStrategyInputSource<'_> {
+    fn next_snapshot<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<DualSnapshot>>> {
+        match self {
+            Self::Poll(source) => source.next_snapshot(),
+            Self::Websocket(source) => source.next_snapshot(),
+        }
+    }
+
+    fn current_time(&self) -> Option<u64> {
+        match self {
+            Self::Poll(source) => source.current_time(),
+            Self::Websocket(source) => source.current_time(),
+        }
+    }
+}
+
+pub struct ReplaySnapshotSource {
+    snapshots: VecDeque<DualSnapshot>,
+    current_ts: Option<u64>,
+}
+
+impl ReplaySnapshotSource {
+    #[must_use]
+    pub fn new(snapshots: Vec<DualSnapshot>) -> Self {
+        Self {
+            snapshots: snapshots.into(),
+            current_ts: None,
+        }
+    }
+}
+
+impl StrategyInputSource for ReplaySnapshotSource {
+    fn next_snapshot<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<DualSnapshot>>> {
+        Box::pin(async move {
+            let next = self.snapshots.pop_front();
+            self.current_ts = next.as_ref().map(|snapshot| snapshot.ts_exchange.floor() as u64);
+            Ok(next)
+        })
+    }
+
+    fn current_time(&self) -> Option<u64> {
+        self.current_ts
     }
 }
 

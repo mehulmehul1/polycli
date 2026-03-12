@@ -1,14 +1,16 @@
 use crate::bot::candles::CandleEngine;
+use crate::bot::feed::{DualSnapshot, MarketSnapshot, ReplayMode, ReplaySnapshotSource, StrategyInputSource};
 use crate::bot::indicators::{IndicatorEngine, IndicatorState};
-use crate::bot::signal::SignalEngine;
+use crate::bot::logging::{EngineEvent, EngineEventLoggers};
+use crate::bot::risk::{decimal_to_f64, GatekeeperState};
 use crate::bot::shadow::{ShadowPosition, TokenSide};
+use crate::bot::signal::SignalEngine;
 use crate::bot::strategy_runner::run_shadow_strategy_step;
-use crate::bot::feed::{DualSnapshot, MarketSnapshot, ReplayMode};
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc, Timelike};
-use serde::{Deserialize, Serialize};
-use polymarket_client_sdk::types::{Decimal, U256};
 use clap::{Args, ValueEnum};
+use polymarket_client_sdk::types::Decimal;
+use serde::{Deserialize, Serialize};
 use serde_json;
 use crate::bot::backtest::{BacktestConfig, BacktestEngine, BeckerParser, PmxtFetcher};
 use crate::bot::backtest::data::load_mock_data;
@@ -76,7 +78,7 @@ pub struct BacktestPipelineArgs {
     pub export_ticks: Option<String>,
 
     /// Replay mode for historical orderbook processing
-    #[arg(long, value_enum, default_value_t = ReplayMode::Event)]
+    #[arg(long, value_enum, default_value_t = ReplayMode::EventByEvent)]
     pub replay_mode: ReplayMode,
 
     /// Optional JSONL event log path
@@ -329,6 +331,7 @@ pub struct MarketState {
     pub ticks: Vec<OrderbookTick>,
 }
 
+#[derive(Debug, Serialize)]
 pub struct PipelineMetrics {
     pub total_ticks: usize,
     pub total_markets: usize,
@@ -374,6 +377,119 @@ impl PipelineMetrics {
         println!("Max Drawdown:     {:.2}%", self.max_drawdown * 100.0);
         println!("==================================================");
     }
+}
+
+#[derive(Debug, Serialize)]
+struct PipelineTickExport {
+    market_slug: String,
+    ts: u64,
+    yes_bid: f64,
+    yes_ask: f64,
+    no_bid: f64,
+    no_ask: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ReplayRow {
+    ts: f64,
+    side: String,
+    bid: f64,
+    ask: f64,
+}
+
+fn build_dual_snapshot(yes_bid: f64, yes_ask: f64, no_bid: f64, no_ask: f64, ts: f64) -> DualSnapshot {
+    DualSnapshot {
+        yes: MarketSnapshot {
+            midpoint: Some(Decimal::from_f64_retain((yes_bid + yes_ask) / 2.0).unwrap_or_default()),
+            best_bid: Some(Decimal::from_f64_retain(yes_bid).unwrap_or_default()),
+            best_ask: Some(Decimal::from_f64_retain(yes_ask).unwrap_or_default()),
+            spread: Some(Decimal::from_f64_retain(yes_ask - yes_bid).unwrap_or_default()),
+            top5_bid_depth: Decimal::from(1000),
+            top5_ask_depth: Decimal::from(1000),
+        },
+        no: MarketSnapshot {
+            midpoint: Some(Decimal::from_f64_retain((no_bid + no_ask) / 2.0).unwrap_or_default()),
+            best_bid: Some(Decimal::from_f64_retain(no_bid).unwrap_or_default()),
+            best_ask: Some(Decimal::from_f64_retain(no_ask).unwrap_or_default()),
+            spread: Some(Decimal::from_f64_retain(no_ask - no_bid).unwrap_or_default()),
+            top5_bid_depth: Decimal::from(1000),
+            top5_ask_depth: Decimal::from(1000),
+        },
+        ts_exchange: ts,
+    }
+}
+
+fn build_replay_snapshots(rows: &[ReplayRow], replay_mode: ReplayMode) -> Vec<DualSnapshot> {
+    let mut snapshots = Vec::new();
+    let (mut yes_bid, mut yes_ask, mut no_bid, mut no_ask) = (0.0, 0.0, 0.0, 0.0);
+    let mut last_complete_second: Option<u64> = None;
+
+    match replay_mode {
+        ReplayMode::EventByEvent => {
+            for row in rows {
+                match row.side.as_str() {
+                    "YES" => {
+                        yes_bid = row.bid;
+                        yes_ask = row.ask;
+                    }
+                    "NO" => {
+                        no_bid = row.bid;
+                        no_ask = row.ask;
+                    }
+                    _ => continue,
+                }
+                if yes_bid > 0.0 && yes_ask > 0.0 && no_bid > 0.0 && no_ask > 0.0 {
+                    snapshots.push(build_dual_snapshot(yes_bid, yes_ask, no_bid, no_ask, row.ts));
+                }
+            }
+        }
+        ReplayMode::LiveParity1s => {
+            for row in rows {
+                let row_second = row.ts.floor() as u64;
+                if let Some(previous_second) = last_complete_second {
+                    if row_second > previous_second && yes_bid > 0.0 && yes_ask > 0.0 && no_bid > 0.0 && no_ask > 0.0 {
+                        for second in previous_second..row_second {
+                            snapshots.push(build_dual_snapshot(
+                                yes_bid,
+                                yes_ask,
+                                no_bid,
+                                no_ask,
+                                second as f64,
+                            ));
+                        }
+                    }
+                }
+
+                match row.side.as_str() {
+                    "YES" => {
+                        yes_bid = row.bid;
+                        yes_ask = row.ask;
+                    }
+                    "NO" => {
+                        no_bid = row.bid;
+                        no_ask = row.ask;
+                    }
+                    _ => continue,
+                }
+
+                if yes_bid > 0.0 && yes_ask > 0.0 && no_bid > 0.0 && no_ask > 0.0 {
+                    last_complete_second = Some(row_second);
+                }
+            }
+
+            if let Some(last_second) = last_complete_second {
+                snapshots.push(build_dual_snapshot(
+                    yes_bid,
+                    yes_ask,
+                    no_bid,
+                    no_ask,
+                    last_second as f64,
+                ));
+            }
+        }
+    }
+
+    snapshots
 }
 
 // ── Internal Helpers ───────────────────────────────────────────────────────────
@@ -682,6 +798,63 @@ fn load_parquet_market_stats(
     Ok(stats)
 }
 
+fn synthetic_slug_for_market(start_ts: i64, crypto: CryptoAsset) -> String {
+    match crypto {
+        CryptoAsset::Btc => format!("btc-updown-5m-{}", start_ts),
+        CryptoAsset::Eth => format!("eth-updown-5m-{}", start_ts),
+        CryptoAsset::Sol => format!("sol-updown-5m-{}", start_ts),
+        CryptoAsset::Xrp => format!("xrp-updown-5m-{}", start_ts),
+        CryptoAsset::All => format!("market-{}", start_ts),
+    }
+}
+
+fn build_top_n_discovered_markets(
+    stats: Vec<ParquetMarketStat>,
+    top_n: usize,
+    crypto: CryptoAsset,
+    slug_filter: Option<&str>,
+) -> Vec<DiscoveredMarket> {
+    let normalized_filter = slug_filter
+        .map(|filter| filter.trim().to_ascii_lowercase())
+        .filter(|filter| !filter.is_empty());
+
+    let mut discovered: Vec<DiscoveredMarket> = stats
+        .into_iter()
+        .filter_map(|stat| {
+            let start_ts = (stat.min_ts.floor() as i64).div_euclid(FIVE_MINUTES_SECONDS) * FIVE_MINUTES_SECONDS;
+            let end_ts = start_ts + FIVE_MINUTES_SECONDS;
+            let slug = synthetic_slug_for_market(start_ts, crypto);
+
+            if let Some(filter) = normalized_filter.as_deref() {
+                if !slug.to_ascii_lowercase().contains(filter) {
+                    return None;
+                }
+            }
+
+            Some(DiscoveredMarket {
+                question: format!("Synthetic replay market {}", stat.condition_id),
+                condition_id: stat.condition_id,
+                slug,
+                start_ts,
+                end_ts,
+                ticks: stat.ticks,
+                min_ts: stat.min_ts,
+                max_ts: stat.max_ts,
+            })
+        })
+        .collect();
+
+    discovered.sort_by(|left, right| {
+        right
+            .ticks
+            .cmp(&left.ticks)
+            .then_with(|| left.start_ts.cmp(&right.start_ts))
+            .then_with(|| left.condition_id.cmp(&right.condition_id))
+    });
+    discovered.truncate(top_n);
+    discovered
+}
+
 fn load_parquet_market_stats_for_ids(
     conn: &duckdb::Connection,
     input: &str,
@@ -828,11 +1001,8 @@ pub async fn discover_markets_for_input(
 #[allow(clippy::too_many_arguments)]
 pub fn process_pipeline_snapshot(
     market: &DiscoveredMarket,
+    dual_snapshot: &DualSnapshot,
     epoch_seconds: u64,
-    yes_bid: f64,
-    yes_ask: f64,
-    no_bid: f64,
-    no_ask: f64,
     candle_engine: &mut CandleEngine,
     ind_1m: &mut IndicatorEngine,
     ind_5s: &mut IndicatorEngine,
@@ -840,34 +1010,28 @@ pub fn process_pipeline_snapshot(
     state_1m: &mut IndicatorState,
     state_5s: &mut IndicatorState,
     shadow: &mut ShadowPosition,
+    gatekeeper: &mut GatekeeperState,
     metrics: &mut PipelineMetrics,
     position_size_usd: f64,
     verbose: bool,
+    event_loggers: Option<&EngineEventLoggers>,
 ) {
     metrics.total_ticks += 1;
 
-    let dual_snapshot = DualSnapshot {
-        yes: MarketSnapshot {
-            midpoint: Some(Decimal::from_f64_retain((yes_bid + yes_ask) / 2.0).unwrap_or_default()),
-            best_bid: Some(Decimal::from_f64_retain(yes_bid).unwrap_or_default()),
-            best_ask: Some(Decimal::from_f64_retain(yes_ask).unwrap_or_default()),
-            spread: Some(Decimal::from_f64_retain(yes_ask - yes_bid).unwrap_or_default()),
-            top5_bid_depth: Decimal::from(1000),
-            top5_ask_depth: Decimal::from(1000),
-        },
-        no: MarketSnapshot {
-            midpoint: Some(Decimal::from_f64_retain((no_bid + no_ask) / 2.0).unwrap_or_default()),
-            best_bid: Some(Decimal::from_f64_retain(no_bid).unwrap_or_default()),
-            best_ask: Some(Decimal::from_f64_retain(no_ask).unwrap_or_default()),
-            spread: Some(Decimal::from_f64_retain(no_ask - no_bid).unwrap_or_default()),
-            top5_bid_depth: Decimal::from(1000),
-            top5_ask_depth: Decimal::from(1000),
-        },
-        ts_exchange: epoch_seconds as f64,
-    };
+    if let Some(loggers) = event_loggers {
+        loggers.log_market(EngineEvent::BookUpdate {
+            ts: epoch_seconds,
+            market_slug: market.slug.clone(),
+            source: "replay".to_string(),
+            yes_bid: dual_snapshot.yes.best_bid.map(decimal_to_f64).unwrap_or(0.0),
+            yes_ask: dual_snapshot.yes.best_ask.map(decimal_to_f64).unwrap_or(0.0),
+            no_bid: dual_snapshot.no.best_bid.map(decimal_to_f64).unwrap_or(0.0),
+            no_ask: dual_snapshot.no.best_ask.map(decimal_to_f64).unwrap_or(0.0),
+        });
+    }
 
     if let Some(step) = run_shadow_strategy_step(
-        &dual_snapshot,
+        dual_snapshot,
         &market.slug,
         &market.slug,
         market.start_ts,
@@ -881,6 +1045,8 @@ pub fn process_pipeline_snapshot(
         state_1m,
         state_5s,
         shadow,
+        gatekeeper,
+        event_loggers,
     ) {
         if step.entry_blocked && verbose {
             println!("[PIPELINE] blocked entry {}", market.condition_id);
@@ -900,6 +1066,12 @@ pub fn process_pipeline_snapshot(
 pub async fn run_backtest_pipeline(args: BacktestPipelineArgs) -> Result<()> {
     let start: DateTime<Utc> = args.start.parse().context("Invalid start time format")?;
     let end: DateTime<Utc> = args.end.parse().context("Invalid end time format")?;
+    let event_loggers = args
+        .event_log
+        .as_deref()
+        .map(EngineEventLoggers::new)
+        .transpose()
+        .context("Failed to create pipeline event logs")?;
 
     println!("[PIPELINE] Backtest Pipeline: {} to {}", start, end);
     let inputs = resolve_pipeline_inputs(args.input.as_deref(), start, end);
@@ -911,10 +1083,20 @@ pub async fn run_backtest_pipeline(args: BacktestPipelineArgs) -> Result<()> {
     let mut shadow = ShadowPosition::default();
     shadow.bankroll_usd = args.capital;
     let mut processed_markets = std::collections::HashSet::new();
+    let mut exported_ticks = if args.export_ticks.is_some() {
+        Some(Vec::new())
+    } else {
+        None
+    };
 
     let bar = indicatif::ProgressBar::new(inputs.len() as u64);
     for input in &inputs {
-        let discovered = discover_markets_for_input(&conn, input, args.min_ticks, args.crypto, Some(&args.filter), args.verbose).await?;
+        let discovered = if let Some(top_n) = args.top_n {
+            let stats = load_parquet_market_stats(&conn, input, args.min_ticks)?;
+            build_top_n_discovered_markets(stats, top_n, args.crypto, Some(&args.filter))
+        } else {
+            discover_markets_for_input(&conn, input, args.min_ticks, args.crypto, Some(&args.filter), args.verbose).await?
+        };
         for market in discovered {
             if market.end_ts < start.timestamp() || market.start_ts > end.timestamp() { continue; }
             if !processed_markets.insert(market.condition_id.clone()) { continue; }
@@ -926,39 +1108,73 @@ pub async fn run_backtest_pipeline(args: BacktestPipelineArgs) -> Result<()> {
             let mut signal_engine = SignalEngine::new_with_band(args.band_low, args.band_high);
             let mut state_1m = IndicatorState::default();
             let mut state_5s = IndicatorState::default();
+            let mut gatekeeper = GatekeeperState::new(args.size * 3.0, 15);
             shadow.full_reset();
 
             let tick_sql = format!(
-                "SELECT CAST(data->>'$.timestamp' AS DOUBLE) as ts, UPPER(data->>'$.side') as side, CAST(data->>'$.best_bid' AS DOUBLE) as bid, CAST(data->>'$.best_ask' AS DOUBLE) as ask FROM read_parquet('{}') WHERE market_id = '{}' ORDER BY ts",
+                "SELECT COALESCE(TRY_CAST(data->>'$.timestamp' AS DOUBLE), 0.0) as ts, COALESCE(UPPER(data->>'$.side'), '') as side, COALESCE(TRY_CAST(data->>'$.best_bid' AS DOUBLE), 0.0) as bid, COALESCE(TRY_CAST(data->>'$.best_ask' AS DOUBLE), 0.0) as ask FROM read_parquet('{}') WHERE market_id = '{}' ORDER BY ts",
                 input, market.condition_id
             );
             let mut stmt = conn.prepare(&tick_sql)?;
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, f64>(0)?, row.get::<_, String>(1)?, row.get::<_, f64>(2)?, row.get::<_, f64>(3)?)))?;
+            let rows = stmt.query_map([], |row| {
+                Ok(ReplayRow {
+                    ts: row.get::<_, f64>(0)?,
+                    side: row.get::<_, String>(1)?,
+                    bid: row.get::<_, f64>(2)?,
+                    ask: row.get::<_, f64>(3)?,
+                })
+            })?;
 
-            let (mut yes_bid, mut yes_ask, mut no_bid, mut no_ask) = (0.0, 0.0, 0.0, 0.0);
-            let mut pending_second: Option<u64> = None;
-
+            let mut replay_rows = Vec::new();
             for row in rows {
-                let (ts, side, bid, ask) = row?;
-                match side.as_str() {
-                    "YES" => { yes_bid = bid; yes_ask = ask; }
-                    "NO" => { no_bid = bid; no_ask = ask; }
-                    _ => continue,
-                }
-                if yes_bid <= 0.0 || no_bid <= 0.0 { continue; }
-
-                let row_second = ts as u64;
-                if let Some(prev) = pending_second {
-                    if row_second > prev {
-                        for s in prev..row_second {
-                            process_pipeline_snapshot(&market, s, yes_bid, yes_ask, no_bid, no_ask, &mut candle_engine, &mut ind_1m, &mut ind_5s, &mut signal_engine, &mut state_1m, &mut state_5s, &mut shadow, &mut metrics, args.size, args.verbose);
-                        }
-                    }
-                }
-                pending_second = Some(row_second);
+                replay_rows.push(row?);
             }
+            let snapshots = build_replay_snapshots(&replay_rows, args.replay_mode);
+            let mut replay_source = ReplaySnapshotSource::new(snapshots);
+
+            let mut last_yes_bid = 0.0;
+            let mut last_no_bid = 0.0;
+            while let Some(snapshot) = replay_source.next_snapshot().await? {
+                last_yes_bid = snapshot.yes.best_bid.map(decimal_to_f64).unwrap_or(last_yes_bid);
+                last_no_bid = snapshot.no.best_bid.map(decimal_to_f64).unwrap_or(last_no_bid);
+                let epoch_seconds = replay_source
+                    .current_time()
+                    .unwrap_or_else(|| snapshot.ts_exchange.floor() as u64);
+                if let Some(rows) = &mut exported_ticks {
+                    rows.push(PipelineTickExport {
+                        market_slug: market.slug.clone(),
+                        ts: epoch_seconds,
+                        yes_bid: snapshot.yes.best_bid.map(decimal_to_f64).unwrap_or(0.0),
+                        yes_ask: snapshot.yes.best_ask.map(decimal_to_f64).unwrap_or(0.0),
+                        no_bid: snapshot.no.best_bid.map(decimal_to_f64).unwrap_or(0.0),
+                        no_ask: snapshot.no.best_ask.map(decimal_to_f64).unwrap_or(0.0),
+                    });
+                }
+                process_pipeline_snapshot(
+                    &market,
+                    &snapshot,
+                    epoch_seconds,
+                    &mut candle_engine,
+                    &mut ind_1m,
+                    &mut ind_5s,
+                    &mut signal_engine,
+                    &mut state_1m,
+                    &mut state_5s,
+                    &mut shadow,
+                    &mut gatekeeper,
+                    &mut metrics,
+                    args.size,
+                    args.verbose,
+                    event_loggers.as_ref(),
+                );
+            }
+
             if shadow.is_active() {
-                let side_bid = if shadow.token_side == Some(TokenSide::Yes) { yes_bid } else { no_bid };
+                let side_bid = if shadow.token_side == Some(TokenSide::Yes) {
+                    last_yes_bid
+                } else {
+                    last_no_bid
+                };
                 let pnl = shadow.pnl(if side_bid > 0.5 { 1.0 } else { 0.0 }) * shadow.position_size_usd;
                 shadow.bankroll_usd += shadow.position_size_usd + pnl;
                 metrics.trades_taken += 1;
@@ -972,6 +1188,19 @@ pub async fn run_backtest_pipeline(args: BacktestPipelineArgs) -> Result<()> {
     metrics.ending_capital = shadow.bankroll_usd;
     metrics.total_pnl = metrics.ending_capital - metrics.starting_capital;
     metrics.total_pnl_pct = (metrics.total_pnl / metrics.starting_capital) * 100.0;
+    if let Some(path) = args.export {
+        let file = std::fs::File::create(path)?;
+        serde_json::to_writer_pretty(file, &metrics)?;
+    }
+    if let Some(path) = args.export_ticks {
+        let mut writer = csv::Writer::from_path(path)?;
+        if let Some(rows) = exported_ticks {
+            for row in rows {
+                writer.serialize(row)?;
+            }
+        }
+        writer.flush()?;
+    }
     metrics.print_summary();
     Ok(())
 }
@@ -1063,9 +1292,16 @@ pub async fn run_extract_midpoints(args: ExtractMidpointsArgs) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
     conn.execute_batch("INSTALL httpfs; LOAD httpfs;")?;
     let id_list = ids.iter().map(|(id, _)| format!("'{}'", id)).collect::<Vec<_>>().join(",");
-    let sql = format!("SELECT market_id, CAST(data->>'$.timestamp' AS DOUBLE) as ts, (CAST(data->>'$.best_bid' AS DOUBLE)+CAST(data->>'$.best_ask' AS DOUBLE))/2.0 as mid, CAST(data->>'$.best_bid' AS DOUBLE) as bid, CAST(data->>'$.best_ask' AS DOUBLE) as ask FROM read_parquet('{}') WHERE market_id IN ({}) ORDER BY ts", args.input, id_list);
+    let sql = format!("SELECT market_id, COALESCE(TRY_CAST(data->>'$.timestamp' AS DOUBLE), 0.0) as ts, (COALESCE(TRY_CAST(data->>'$.best_bid' AS DOUBLE), 0.0)+COALESCE(TRY_CAST(data->>'$.best_ask' AS DOUBLE), 0.0))/2.0 as mid, COALESCE(TRY_CAST(data->>'$.best_bid' AS DOUBLE), 0.0) as bid, COALESCE(TRY_CAST(data->>'$.best_ask' AS DOUBLE), 0.0) as ask FROM read_parquet('{}') WHERE market_id IN ({}) ORDER BY ts", args.input, id_list);
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |row| Ok(MidpointRow { market_id: row.get(0)?, market_slug: String::new(), timestamp: row.get::<_, f64>(1)? as i64, midpoint: row.get(2)?, best_bid: row.get(3)?, best_ask: row.get(4)? }))?;
+    let rows = stmt.query_map([], |row| Ok(MidpointRow {
+        market_id: row.get(0)?,
+        market_slug: String::new(),
+        timestamp: row.get::<_, f64>(1)? as i64,
+        midpoint: row.get::<_, f64>(2)?,
+        best_bid: row.get::<_, f64>(3)?,
+        best_ask: row.get::<_, f64>(4)?,
+    }))?;
     let results: Vec<MidpointRow> = rows.collect::<Result<Vec<_>, _>>()?;
     if let Some(path) = args.csv {
         let mut w = csv::Writer::from_path(path)?;
@@ -1082,4 +1318,64 @@ pub fn run_inspect_parquet(args: InspectParquetArgs) -> Result<()> {
     let rows = stmt.query_map([], |row| Ok(row.get::<_, Option<String>>(0).unwrap_or_default()))?;
     for (i, r) in rows.enumerate() { println!("{}: {:?}", i, r?); }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_top_n_discovered_markets, CryptoAsset, ParquetMarketStat, ReplayMode, ReplayRow,
+        build_replay_snapshots,
+    };
+
+    #[test]
+    fn top_n_discovery_uses_tick_ranking_and_synthetic_btc_slugs() {
+        let discovered = build_top_n_discovered_markets(
+            vec![
+                ParquetMarketStat {
+                    condition_id: "c-low".to_string(),
+                    ticks: 10,
+                    min_ts: 1_700_000_000.0,
+                    max_ts: 1_700_000_100.0,
+                },
+                ParquetMarketStat {
+                    condition_id: "c-high".to_string(),
+                    ticks: 30,
+                    min_ts: 1_700_000_300.0,
+                    max_ts: 1_700_000_350.0,
+                },
+                ParquetMarketStat {
+                    condition_id: "c-mid".to_string(),
+                    ticks: 20,
+                    min_ts: 1_700_000_600.0,
+                    max_ts: 1_700_000_620.0,
+                },
+            ],
+            2,
+            CryptoAsset::Btc,
+            Some("btc-updown-5m"),
+        );
+
+        assert_eq!(discovered.len(), 2);
+        assert_eq!(discovered[0].condition_id, "c-high");
+        assert_eq!(discovered[1].condition_id, "c-mid");
+        assert!(discovered.iter().all(|market| market.slug.starts_with("btc-updown-5m-")));
+    }
+
+    #[test]
+    fn live_parity_replay_emits_one_snapshot_per_second_boundary() {
+        let snapshots = build_replay_snapshots(
+            &[
+                ReplayRow { ts: 1000.1, side: "YES".to_string(), bid: 0.40, ask: 0.42 },
+                ReplayRow { ts: 1000.2, side: "NO".to_string(), bid: 0.58, ask: 0.60 },
+                ReplayRow { ts: 1001.1, side: "YES".to_string(), bid: 0.43, ask: 0.45 },
+                ReplayRow { ts: 1002.2, side: "NO".to_string(), bid: 0.55, ask: 0.57 },
+            ],
+            ReplayMode::LiveParity1s,
+        );
+
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots[0].ts_exchange, 1000.0);
+        assert_eq!(snapshots[1].ts_exchange, 1001.0);
+        assert_eq!(snapshots[2].ts_exchange, 1002.0);
+    }
 }

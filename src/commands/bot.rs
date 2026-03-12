@@ -1,63 +1,32 @@
 use crate::auth;
-use crate::bot::backtest::{BacktestConfig, BacktestEngine, BeckerParser, PmxtFetcher};
-use crate::bot::backtest::data::load_mock_data;
-use crate::bot::backtest::metrics::ParameterSweepResult;
 use crate::bot::candles::CandleEngine;
 use crate::bot::discovery::{
-    self, CryptoAsset, WatchedMarket,
-    BTC_UPDOWN_SLUG_PREFIX, BTC_UPDOWN_15M_SLUG_PREFIX, FIVE_MINUTES_SECONDS,
-    FIFTEEN_MINUTES_SECONDS,
-    discover_market_loop, discover_active_btc_market,
-    fetch_snapshot,
-    is_btc_up_down_5m,
-    is_btc_updown_slug_or_question,
-    btc_updown_label_from_question, candidate_slug_timestamps,
-    is_active_now, market_label, market_to_watched,
-    select_binary_tokens,
+    discover_market_loop, FIVE_MINUTES_SECONDS,
 };
 use crate::bot::pipeline::{
     self, BacktestArgs, MonteCarloArgs, SweepArgs, FetchPmxtArgs,
-    ListMarketsArgs, ListMarketsOutput, MidpointRow, ParquetMarketStat,
-    ResolvedSlugMarket, ExtractMidpointsArgs, InspectParquetArgs,
-    BacktestPipelineArgs,
-    gamma_market_condition_id_hex, hour_btc_5m_slugs, is_updown_5m_text,
-    market_matches_exact_filter, matches_crypto_text,
-    has_binary_directional_tokens, infer_market_window, parse_slug_timestamp,
-    window_overlaps_hour,
+    ListMarketsArgs, ExtractMidpointsArgs, InspectParquetArgs, BacktestPipelineArgs,
 };
 use crate::bot::feed::{
-    BookChangeSide, BookDeltaEvent, DualBookState, DualSnapshot, LiveFeedMode, MarketSnapshot,
-    MarketWebsocketFeed, OutcomeSide, ReplayMode,
+    LiveFeedMode, LiveStrategyInputSource, StrategyInputSource,
 };
 use crate::bot::execution::{
     handle_live_signals, get_usdc_balance, try_settle_pending,
-    PendingSettlement, LivePosition, OrderResult,
+    PendingSettlement, LivePosition,
 };
 use crate::bot::indicators::{IndicatorEngine, IndicatorState};
-use crate::bot::logging::JsonlEventLogger;
-use crate::bot::monte_carlo::{MonteCarloSimulator, SimulationConfig};
-use crate::bot::risk::{best_ask_price, best_bid_price, midpoint_price, FilterReason, decimal_to_f64, trade_allowed};
-use crate::bot::shadow::{ShadowExitRecord, ShadowPosition, ShadowStepResult, TokenSide};
-use crate::bot::signal::{SignalEngine, EntrySignal, ExitSignal, SignalState};
+use crate::bot::logging::{EngineEvent, EngineEventLoggers};
+use crate::bot::risk::{best_ask_price, best_bid_price, midpoint_price, GatekeeperState, decimal_to_f64};
+use crate::bot::shadow::{ShadowPosition, TokenSide};
+use crate::bot::signal::SignalEngine;
 use crate::bot::strategy_runner::run_shadow_strategy_step;
 use crate::bot::validation::ValidationTracker;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Timelike, Utc};
-use clap::{Args, Subcommand, ValueEnum};
-use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::auth::Normal;
+use chrono::Utc;
+use clap::{Args, Subcommand};
 use polymarket_client_sdk::clob;
-use polymarket_client_sdk::clob::types::request::{MidpointRequest, OrderBookSummaryRequest, PriceRequest, BalanceAllowanceRequest};
-use polymarket_client_sdk::clob::types::response::MarketResponse;
-use polymarket_client_sdk::clob::types::{Side, OrderType, AssetType, Amount};
 use polymarket_client_sdk::gamma;
-use polymarket_client_sdk::gamma::types::request::{
-    MarketBySlugRequest, MarketsRequest, SearchRequest,
-};
-use polymarket_client_sdk::gamma::types::response::Market;
-use polymarket_client_sdk::types::{Decimal, U256};
-use serde::{Deserialize, Serialize};
-use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
+use tokio::time::{Duration, MissedTickBehavior, interval};
 
 #[derive(Args)]
 pub struct BotArgs {
@@ -99,9 +68,21 @@ pub struct LiveShadowArgs {
     #[arg(long, value_enum, default_value_t = LiveFeedMode::Websocket)]
     pub feed: LiveFeedMode,
 
-    /// Optional JSONL event log path
+    /// Optional structured event log path or directory
     #[arg(long)]
     pub event_log: Option<String>,
+
+    /// Daily realized loss limit in USD before halting new entries
+    #[arg(long, default_value = "2.0")]
+    pub daily_loss_limit: f64,
+
+    /// Cooldown duration after a losing trade
+    #[arg(long, default_value = "15")]
+    pub cooldown_seconds: u64,
+
+    /// Start the engine in an emergency-halted state
+    #[arg(long)]
+    pub emergency_halt: bool,
 }
 
 
@@ -117,6 +98,26 @@ pub struct TradeBtcArgs {
     /// Dry run mode - show signals but don't place orders
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Live feed mode for live trading
+    #[arg(long, value_enum, default_value_t = LiveFeedMode::Websocket)]
+    pub feed: LiveFeedMode,
+
+    /// Optional structured event log path or directory
+    #[arg(long)]
+    pub event_log: Option<String>,
+
+    /// Daily realized loss limit in USD before halting new entries
+    #[arg(long, default_value = "5.0")]
+    pub daily_loss_limit: f64,
+
+    /// Cooldown duration after a losing trade
+    #[arg(long, default_value = "15")]
+    pub cooldown_seconds: u64,
+
+    /// Start the engine in an emergency-halted state
+    #[arg(long)]
+    pub emergency_halt: bool,
 }
 
 // Migrated to crate::bot::pipeline
@@ -149,32 +150,44 @@ pub async fn execute(args: BotArgs) -> Result<()> {
     }
 }
 
-async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs) -> Result<()> {
-    let gamma_client = gamma::Client::default();
-    let clob_client = clob::Client::default();
-    let event_logger = live_args
-        .event_log
-        .as_deref()
-        .map(JsonlEventLogger::new)
+fn create_event_loggers(path: Option<&str>) -> Result<Option<EngineEventLoggers>> {
+    path.map(EngineEventLoggers::new)
         .transpose()
-        .context("Failed to create live event log")?;
+        .context("Failed to create structured event logs")
+}
 
-    let mut watched = discover_market_loop(&gamma_client).await;
-    let mut websocket_feed = if live_args.feed == LiveFeedMode::Websocket {
-        Some(
-            MarketWebsocketFeed::connect(
+async fn create_live_input_source<'a>(
+    feed_mode: LiveFeedMode,
+    client: &'a clob::Client,
+    watched: &crate::bot::discovery::WatchedMarket,
+) -> Result<LiveStrategyInputSource<'a>> {
+    match feed_mode {
+        LiveFeedMode::Poll => Ok(LiveStrategyInputSource::poll(
+            client,
+            watched.yes_token_id,
+            watched.no_token_id,
+        )),
+        LiveFeedMode::Websocket => {
+            LiveStrategyInputSource::websocket(
                 watched.condition_id.clone(),
                 watched.yes_token_id,
                 watched.no_token_id,
-                event_logger.clone(),
+                None,
             )
             .await
-            .context("Failed to connect Polymarket market websocket")?,
-        )
-    } else {
-        None
-    };
-    let mut live_book_state = DualBookState::default();
+        }
+    }
+}
+
+async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs) -> Result<()> {
+    let gamma_client = gamma::Client::default();
+    let clob_client = clob::Client::default();
+    let event_loggers = create_event_loggers(live_args.event_log.as_deref())?;
+
+    let mut watched = discover_market_loop(&gamma_client).await;
+    let mut input_source = create_live_input_source(live_args.feed, &clob_client, &watched)
+        .await
+        .context("Failed to create live strategy input source")?;
 
     let mut validator = max_markets.map(ValidationTracker::new);
 
@@ -186,6 +199,11 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
     candle_engine.set_debug(false);
 
     let mut shadow = ShadowPosition::default();
+    let mut gatekeeper =
+        GatekeeperState::new(live_args.daily_loss_limit, live_args.cooldown_seconds);
+    if live_args.emergency_halt {
+        gatekeeper.halt();
+    }
 
     let mut state_1m = IndicatorState::default();
     let mut state_5s = IndicatorState::default();
@@ -281,23 +299,10 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
                     );
                     watched = discover_market_loop(&gamma_client).await;
                     current_slug = watched.slug.clone();
-                    live_book_state = DualBookState::default();
-
-                    if let Some(feed) = websocket_feed.take() {
-                        feed.shutdown().await;
-                    }
-                    if live_args.feed == LiveFeedMode::Websocket {
-                        websocket_feed = Some(
-                            MarketWebsocketFeed::connect(
-                                watched.condition_id.clone(),
-                                watched.yes_token_id,
-                                watched.no_token_id,
-                                event_logger.clone(),
-                            )
-                            .await
-                            .context("Failed to reconnect Polymarket market websocket")?,
-                        );
-                    }
+                    input_source.shutdown().await;
+                    input_source = create_live_input_source(live_args.feed, &clob_client, &watched)
+                        .await
+                        .context("Failed to recreate live strategy input source")?;
 
                     signal_engine.reset();
                     ind_1m.reset();
@@ -312,49 +317,32 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
                     println!("========================================");
                 }
 
-                let dual_snapshot = match live_args.feed {
-                    LiveFeedMode::Poll => {
-                        let yes_snapshot = match fetch_snapshot(&clob_client, watched.yes_token_id).await {
-                            Ok(s) => s,
-                            Err(err) => {
-                                eprintln!("[warn] Failed to fetch YES market data: {err:#}");
-                                continue;
-                            }
-                        };
-                        let no_snapshot = match fetch_snapshot(&clob_client, watched.no_token_id).await {
-                            Ok(s) => s,
-                            Err(err) => {
-                                eprintln!("[warn] Failed to fetch NO market data: {err:#}");
-                                continue;
-                            }
-                        };
-                        DualSnapshot {
-                            yes: yes_snapshot,
-                            no: no_snapshot,
-                            ts_exchange: Utc::now().timestamp_millis() as f64 / 1000.0,
-                        }
-                    }
-                    LiveFeedMode::Websocket => {
-                        let Some(feed) = websocket_feed.as_mut() else {
-                            continue;
-                        };
-                        while let Some(event) = feed.try_recv() {
-                            live_book_state.apply(&event);
-                        }
-                        let Some(snapshot) = live_book_state.snapshot() else {
-                            continue;
-                        };
-                        snapshot
+                let dual_snapshot = match input_source.next_snapshot().await {
+                    Ok(Some(snapshot)) => snapshot,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        eprintln!("[warn] Failed to fetch live snapshot: {err:#}");
+                        continue;
                     }
                 };
 
                 if let Some(midpoint) = midpoint_price(&dual_snapshot.yes) {
                     last_yes_bid = best_bid_price(&dual_snapshot.yes).unwrap_or(last_yes_bid);
                     last_no_bid = best_bid_price(&dual_snapshot.no).unwrap_or(last_no_bid);
-                    let epoch_seconds = dual_snapshot.ts_exchange.floor() as u64;
+                    let epoch_seconds = input_source
+                        .current_time()
+                        .unwrap_or_else(|| dual_snapshot.ts_exchange.floor() as u64);
 
-                    if let Some(logger) = &event_logger {
-                        logger.log("normalized_snapshots", &dual_snapshot);
+                    if let Some(loggers) = &event_loggers {
+                        loggers.log_market(EngineEvent::BookUpdate {
+                            ts: epoch_seconds,
+                            market_slug: watched.slug.clone(),
+                            source: format!("{:?}", live_args.feed),
+                            yes_bid: best_bid_price(&dual_snapshot.yes).unwrap_or(0.0),
+                            yes_ask: best_ask_price(&dual_snapshot.yes).unwrap_or(0.0),
+                            no_bid: best_bid_price(&dual_snapshot.no).unwrap_or(0.0),
+                            no_ask: best_ask_price(&dual_snapshot.no).unwrap_or(0.0),
+                        });
                     }
 
                     if epoch_seconds % 10 == 0 {
@@ -385,6 +373,8 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
                         &mut state_1m,
                         &mut state_5s,
                         &mut shadow,
+                        &mut gatekeeper,
+                        event_loggers.as_ref(),
                     ) {
                         if step.signal_seen {
                             if let Some(v) = &mut validator {
@@ -400,9 +390,6 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
                             if let Some(v) = &mut validator {
                                 v.record_entry_taken();
                             }
-                        }
-                        if let Some(logger) = &event_logger {
-                            logger.log("strategy_steps", &step);
                         }
                         if let Some(exit_trade) = step.exit_trade {
                             if let Some(v) = &mut validator {
@@ -450,9 +437,7 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
         }
     }
 
-    if let Some(feed) = websocket_feed {
-        feed.shutdown().await;
-    }
+    input_source.shutdown().await;
 
     Ok(())
 }
@@ -464,6 +449,7 @@ async fn trade_btc_live(args: TradeBtcArgs) -> Result<()> {
     let clob_client = auth::authenticate_with_signer(&signer, None).await?;
     let gamma_client = gamma::Client::default();
     let read_client = clob::Client::default();
+    let event_loggers = create_event_loggers(args.event_log.as_deref())?;
 
     let balance = get_usdc_balance(&clob_client).await?;
     println!("[LIVE] USDC Balance: ${:.2}", balance);
@@ -473,6 +459,9 @@ async fn trade_btc_live(args: TradeBtcArgs) -> Result<()> {
     }
 
     let mut watched = discover_market_loop(&gamma_client).await;
+    let mut input_source = create_live_input_source(args.feed, &read_client, &watched)
+        .await
+        .context("Failed to create live trading input source")?;
 
     let mut ind_1m = IndicatorEngine::new();
     let mut ind_5s = IndicatorEngine::new();
@@ -481,10 +470,12 @@ async fn trade_btc_live(args: TradeBtcArgs) -> Result<()> {
     candle_engine.set_debug(false);
 
     let mut position = LivePosition::default();
+    let mut gatekeeper = GatekeeperState::new(args.daily_loss_limit, args.cooldown_seconds);
+    if args.emergency_halt {
+        gatekeeper.halt();
+    }
     let mut state_1m = IndicatorState::default();
     let mut state_5s = IndicatorState::default();
-
-    let mut last_midpoint = None;
     let mut current_slug = watched.slug.clone();
 
     let mut pending_settlements: Vec<PendingSettlement> = Vec::new();
@@ -499,6 +490,7 @@ async fn trade_btc_live(args: TradeBtcArgs) -> Result<()> {
     println!("[LIVE] Entry: slope > 0.002 + breakout | Exit: slope flip");
     println!("[LIVE] Range: 0.35 - 0.65 | Size: ${:.2}", args.size);
     println!("[LIVE] Auto-sell enabled for pending positions");
+    println!("[LIVE] Feed: {:?}", args.feed);
     println!("========================================");
 
     loop {
@@ -526,6 +518,8 @@ async fn trade_btc_live(args: TradeBtcArgs) -> Result<()> {
                         &read_client,
                         &clob_client,
                         &signer,
+                        &mut gatekeeper,
+                        event_loggers.as_ref(),
                         now,
                     ).await;
                 }
@@ -569,13 +563,16 @@ async fn trade_btc_live(args: TradeBtcArgs) -> Result<()> {
                     println!("[LIVE] Market {} ended. Looking for next market...", watched.slug);
                     watched = discover_market_loop(&gamma_client).await;
                     current_slug = watched.slug.clone();
+                    input_source.shutdown().await;
+                    input_source = create_live_input_source(args.feed, &read_client, &watched)
+                        .await
+                        .context("Failed to recreate live trading input source")?;
 
                     signal_engine.reset();
                     ind_1m.reset();
                     ind_5s.reset();
                     state_1m = IndicatorState::default();
                     state_5s = IndicatorState::default();
-                    last_midpoint = None;
 
                     println!("[MARKET RESET] All engines cleared | {}", watched.slug);
                     if !pending_settlements.is_empty() {
@@ -585,32 +582,31 @@ async fn trade_btc_live(args: TradeBtcArgs) -> Result<()> {
                     continue;
                 }
 
-                let yes_snapshot = match fetch_snapshot(&read_client, watched.yes_token_id).await {
-                    Ok(s) => s,
+                let dual_snapshot = match input_source.next_snapshot().await {
+                    Ok(Some(snapshot)) => snapshot,
+                    Ok(None) => continue,
                     Err(err) => {
-                        eprintln!("[warn] Failed to fetch YES market data: {err:#}");
+                        eprintln!("[warn] Failed to fetch live trading snapshot: {err:#}");
                         continue;
                     }
-                };
-                let no_snapshot = match fetch_snapshot(&read_client, watched.no_token_id).await {
-                    Ok(s) => s,
-                    Err(err) => {
-                        eprintln!("[warn] Failed to fetch NO market data: {err:#}");
-                        continue;
-                    }
-                };
-
-                let dual_snapshot = DualSnapshot {
-                    yes: yes_snapshot,
-                    no: no_snapshot,
-                    ts_exchange: now.timestamp_millis() as f64 / 1000.0,
                 };
 
                 if let Some(midpoint) = midpoint_price(&dual_snapshot.yes) {
-                    last_midpoint = Some(midpoint);
                     let spread_f64 = dual_snapshot.yes.spread.map(decimal_to_f64).unwrap_or(0.0);
                     let simulated_volume = decimal_to_f64(dual_snapshot.yes.top5_bid_depth + dual_snapshot.yes.top5_ask_depth);
-                    let epoch_seconds = now.timestamp() as u64;
+                    let epoch_seconds = input_source.current_time().unwrap_or(now.timestamp() as u64);
+
+                    if let Some(loggers) = &event_loggers {
+                        loggers.log_market(EngineEvent::BookUpdate {
+                            ts: epoch_seconds,
+                            market_slug: watched.slug.clone(),
+                            source: format!("{:?}", args.feed),
+                            yes_bid: best_bid_price(&dual_snapshot.yes).unwrap_or(0.0),
+                            yes_ask: best_ask_price(&dual_snapshot.yes).unwrap_or(0.0),
+                            no_bid: best_bid_price(&dual_snapshot.no).unwrap_or(0.0),
+                            no_ask: best_ask_price(&dual_snapshot.no).unwrap_or(0.0),
+                        });
+                    }
 
                     if epoch_seconds % 10 == 0 {
                         let yes_bid = best_bid_price(&dual_snapshot.yes).unwrap_or(0.0);
@@ -632,11 +628,23 @@ async fn trade_btc_live(args: TradeBtcArgs) -> Result<()> {
                             state_5s = ind_5s.update(&c);
 
                             let signal = signal_engine.update(&state_5s, &state_1m, midpoint);
+                            if let Some(loggers) = &event_loggers {
+                                loggers.log_strategy(EngineEvent::StrategySignal {
+                                    ts: epoch_seconds,
+                                    market_slug: watched.slug.clone(),
+                                    midpoint,
+                                    entry: format!("{:?}", signal.entry),
+                                    exit: format!("{:?}", signal.exit),
+                                    detail: "live_signal_engine".to_string(),
+                                });
+                            }
 
                             handle_live_signals(
                                 &signal,
                                 &dual_snapshot,
                                 &mut position,
+                                &mut gatekeeper,
+                                event_loggers.as_ref(),
                                 &watched,
                                 epoch_seconds,
                                 args.size,
@@ -667,6 +675,7 @@ async fn trade_btc_live(args: TradeBtcArgs) -> Result<()> {
             }
         }
     }
+    input_source.shutdown().await;
     Ok(())
 }
 
@@ -707,7 +716,9 @@ async fn run_backtest_pipeline(args: BacktestPipelineArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::bot::feed::MarketSnapshot;
+    use crate::bot::risk::{FilterReason, trade_allowed};
+    use polymarket_client_sdk::types::Decimal;
 
     #[test]
     fn trade_allowed_passes_good_conditions() {

@@ -27,27 +27,27 @@
 - [x] Verify `cargo build` succeeds
 
 ## Phase 4: Add Risk Gatekeeper (inspired by boooot)
-- [ ] Expand [src/bot/risk.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/risk.rs) with `GateDecision` enum, `GatekeeperState` struct
-- [ ] Add daily loss limit circuit breaker
-- [ ] Add emergency halt flag
-- [ ] Add cooldown tracking
-- [ ] Wire gatekeeper into [watch_btc_market](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#292-599) and [trade_btc_live](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#665-875)
-- [ ] Add unit tests for gate decisions
-- [ ] Verify `cargo test` passes
+- [x] Expand [src/bot/risk.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/risk.rs) with `GateDecision` enum, `GatekeeperState` struct
+- [x] Add daily loss limit circuit breaker
+- [x] Add emergency halt flag
+- [x] Add cooldown tracking
+- [x] Wire gatekeeper into [watch_btc_market](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#292-599) and [trade_btc_live](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#665-875)
+- [x] Add unit tests for gate decisions
+- [x] Verify `cargo test` passes
 
 ## Phase 5: Add Structured Event Logging
-- [ ] Expand [src/bot/logging.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/logging.rs) with typed `EngineEvent` enum
-- [ ] Add separate JSONL log channels: market, strategy, execution
-- [ ] Wire event logging into strategy runner and gatekeeper
-- [ ] Verify log output on a short live session
+- [x] Expand [src/bot/logging.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/logging.rs) with typed `EngineEvent` enum
+- [x] Add separate JSONL log channels: market, strategy, execution
+- [x] Wire event logging into strategy runner and gatekeeper
+- [x] Verify log output on a short live session
 
 ## Phase 6: Feed Normalization + WebSocket Live Feed
-- [ ] Ensure [BookDeltaEvent](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/feed.rs#43-57) and [DualSnapshot](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/feed.rs#69-74) are the single source of truth
-- [ ] Make [watch_btc_market](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#292-599) consume [MarketWebsocketFeed](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/feed.rs#159-163) events instead of REST polling
-- [ ] Add `StrategyInputSource` trait for live/replay parity
-- [ ] Verify live `watch-btc` works with WebSocket feed
+- [x] Ensure [BookDeltaEvent](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/feed.rs#43-57) and [DualSnapshot](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/feed.rs#69-74) are the single source of truth
+- [x] Make [watch_btc_market](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/commands/bot.rs#292-599) consume [MarketWebsocketFeed](file:///c:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli/src/bot/feed.rs#159-163) events instead of REST polling
+- [x] Add `StrategyInputSource` trait for live/replay parity
+- [x] Verify live `watch-btc` works with WebSocket feed
 
 ## Phase 7: Event-by-Event Backtest Replay
-- [ ] Add `ReplayMode` enum (EventByEvent, LiveParity1s)
-- [ ] Implement event-by-event parquet row replay
-- [ ] Verify backtest parity between modes
+- [x] Add `ReplayMode` enum (EventByEvent, LiveParity1s)
+- [x] Implement event-by-event parquet row replay
+- [x] Verify backtest parity between modes

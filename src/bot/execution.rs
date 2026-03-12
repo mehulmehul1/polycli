@@ -1,9 +1,13 @@
 use crate::bot::discovery::{WatchedMarket, FIVE_MINUTES_SECONDS, fetch_snapshot};
 use crate::bot::feed::DualSnapshot;
-use crate::bot::risk::{best_ask_price, best_bid_price, decimal_to_f64, trade_allowed};
+use crate::bot::logging::{EngineEvent, EngineEventLoggers};
+use crate::bot::risk::{
+    best_ask_price, best_bid_price, decimal_to_f64, EntryContext, FilterReason, GateDecision,
+    GatekeeperState, TradeDirection,
+};
 use crate::bot::shadow::TokenSide;
 use crate::bot::signal::{EntrySignal, ExitSignal};
-use anyhow::{Result, Context};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::Normal;
@@ -104,6 +108,8 @@ pub async fn try_settle_pending(
     read_client: &clob::Client,
     clob_client: &clob::Client<Authenticated<Normal>>,
     signer: &(impl polymarket_client_sdk::auth::Signer + Sync),
+    gatekeeper: &mut GatekeeperState,
+    event_loggers: Option<&EngineEventLoggers>,
     now: DateTime<Utc>,
 ) {
     let mut settled = Vec::new();
@@ -193,10 +199,36 @@ pub async fn try_settle_pending(
             Ok(result) => {
                 let pnl_pct = (bid_price - p.entry_price) / p.entry_price * 100.0;
                 let pnl_usd = pnl_pct / 100.0 * (shares_to_sell * p.entry_price);
+                gatekeeper.record_trade_result(now.timestamp() as u64, pnl_usd);
                 println!(
                     "[SETTLED] {} | {} | {:.2}% | ${:.2} | Order: {}",
                     p.market_slug, side_name, pnl_pct, pnl_usd, result.order_id
                 );
+                if let Some(loggers) = event_loggers {
+                    loggers.log_execution(EngineEvent::PendingSettlement {
+                        ts: now.timestamp() as u64,
+                        market_slug: p.market_slug.clone(),
+                        side: side_name.to_string(),
+                        bid_price,
+                        shares: shares_to_sell,
+                    });
+                    loggers.log_execution(EngineEvent::LiveExit {
+                        ts: now.timestamp() as u64,
+                        market_slug: p.market_slug.clone(),
+                        side: side_name.to_string(),
+                        price: bid_price,
+                        pnl_usd,
+                        order_id: Some(result.order_id.clone()),
+                    });
+                    if gatekeeper.emergency_halt {
+                        loggers.log_execution(EngineEvent::EmergencyHalt {
+                            ts: now.timestamp() as u64,
+                            market_slug: p.market_slug.clone(),
+                            daily_pnl: gatekeeper.daily_pnl,
+                            reason: "daily loss limit".to_string(),
+                        });
+                    }
+                }
                 settled.push(i);
             }
             Err(err) => {
@@ -273,6 +305,8 @@ pub async fn handle_live_signals(
     signal: &crate::bot::signal::SignalState,
     dual_snapshot: &DualSnapshot,
     position: &mut LivePosition,
+    gatekeeper: &mut GatekeeperState,
+    event_loggers: Option<&EngineEventLoggers>,
     market: &WatchedMarket,
     timestamp: u64,
     size_usd: f64,
@@ -283,38 +317,71 @@ pub async fn handle_live_signals(
     let time_remaining = (market.end_time.timestamp() - Utc::now().timestamp()).max(0);
 
     if signal.entry != EntrySignal::None && !position.is_active() {
-        if time_remaining < 30 || time_remaining > 280 {
-            return;
-        }
-
-        if timestamp - position.last_exit_timestamp < 15 {
-            return;
-        }
-
-        match signal.entry {
-            EntrySignal::Long if position.yes_blocked => {
-                println!("[BLOCKED] YES direction locked after loss");
-                return;
-            }
-            EntrySignal::Short if position.no_blocked => {
-                println!("[BLOCKED] NO direction locked after loss");
-                return;
-            }
-            _ => {}
-        }
-
         let (token_id, token_side, snapshot_side) = match signal.entry {
             EntrySignal::Long => (market.yes_token_id, TokenSide::Yes, &dual_snapshot.yes),
             EntrySignal::Short => (market.no_token_id, TokenSide::No, &dual_snapshot.no),
             EntrySignal::None => return,
+        };
+        let direction = match signal.entry {
+            EntrySignal::Long => TradeDirection::Yes,
+            EntrySignal::Short => TradeDirection::No,
+            EntrySignal::None => return,
+        };
+        let direction_locked = match signal.entry {
+            EntrySignal::Long => position.yes_blocked,
+            EntrySignal::Short => position.no_blocked,
+            EntrySignal::None => false,
         };
 
         let yes_ask = best_ask_price(&dual_snapshot.yes).unwrap_or(0.0);
         let no_ask = best_ask_price(&dual_snapshot.no).unwrap_or(0.0);
 
         let contract_age = (timestamp as i64) - (market.end_time.timestamp() - FIVE_MINUTES_SECONDS);
+        let decision = gatekeeper.check_entry(
+            snapshot_side,
+            &EntryContext {
+                timestamp,
+                time_remaining,
+                min_time_remaining: 30,
+                max_time_remaining: 280,
+                contract_age,
+                yes_ask,
+                no_ask,
+                bankroll_available: size_usd,
+                position_size_usd: size_usd,
+                direction_locked,
+                direction,
+            },
+        );
 
-        if let Err(reason) = trade_allowed(snapshot_side, time_remaining, contract_age, yes_ask, no_ask) {
+        if let Some(loggers) = event_loggers {
+            match &decision {
+                GateDecision::Approved { reason } => loggers.log_strategy(EngineEvent::GateDecision {
+                    ts: timestamp,
+                    market_slug: market.slug.clone(),
+                    decision: "approved".to_string(),
+                    reason: reason.clone(),
+                }),
+                GateDecision::Blocked { reason } => {
+                    loggers.log_strategy(EngineEvent::GateDecision {
+                        ts: timestamp,
+                        market_slug: market.slug.clone(),
+                        decision: "blocked".to_string(),
+                        reason: format!("{reason:?}"),
+                    });
+                    if matches!(reason, FilterReason::EmergencyHalt | FilterReason::DailyLossLimit) {
+                        loggers.log_execution(EngineEvent::EmergencyHalt {
+                            ts: timestamp,
+                            market_slug: market.slug.clone(),
+                            daily_pnl: gatekeeper.daily_pnl,
+                            reason: format!("{reason:?}"),
+                        });
+                    }
+                }
+            }
+        }
+
+        if let GateDecision::Blocked { reason } = decision {
             println!("[FILTER BLOCKED] {:?} | Reason: {:?}", token_side, reason);
             return;
         }
@@ -341,6 +408,16 @@ pub async fn handle_live_signals(
             position.entry_price = entry_price;
             position.shares = (size_usd / entry_price * 100.0).floor() / 100.0;
             position.entry_timestamp = timestamp;
+            if let Some(loggers) = event_loggers {
+                loggers.log_execution(EngineEvent::LiveEntry {
+                    ts: timestamp,
+                    market_slug: market.slug.clone(),
+                    side: side_name.to_string(),
+                    price: entry_price,
+                    size_usd,
+                    order_id: None,
+                });
+            }
             return;
         }
 
@@ -359,6 +436,16 @@ pub async fn handle_live_signals(
                     "[ORDER FILLED] {} | {} @ {:.4} | {} shares | Order: {}",
                     market.label, side_name, entry_price, filled_rounded, order_result.order_id
                 );
+                if let Some(loggers) = event_loggers {
+                    loggers.log_execution(EngineEvent::LiveEntry {
+                        ts: timestamp,
+                        market_slug: market.slug.clone(),
+                        side: side_name.to_string(),
+                        price: entry_price,
+                        size_usd,
+                        order_id: Some(order_result.order_id.clone()),
+                    });
+                }
             }
             Err(err) => {
                 eprintln!("[ORDER FAILED] {:?}", err);
@@ -426,6 +513,17 @@ pub async fn handle_live_signals(
             if dry_run {
                 println!("[DRY RUN] Would place market sell order: {} shares of {}", actual_shares, side_name);
                 let was_loss = pnl_pct < 0.0;
+                gatekeeper.record_trade_result(timestamp, pnl_usd);
+                if let Some(loggers) = event_loggers {
+                    loggers.log_execution(EngineEvent::LiveExit {
+                        ts: timestamp,
+                        market_slug: market.slug.clone(),
+                        side: side_name.to_string(),
+                        price: exit_price,
+                        pnl_usd,
+                        order_id: None,
+                    });
+                }
                 position.reset(timestamp, was_loss);
                 return;
             }
@@ -433,10 +531,29 @@ pub async fn handle_live_signals(
             match place_market_sell(clob_client, signer, token_id, actual_shares).await {
                 Ok(order_result) => {
                     let was_loss = pnl_pct < 0.0;
+                    gatekeeper.record_trade_result(timestamp, pnl_usd);
                     println!(
                         "[EXIT FILLED] {} | {:.2}% | ${:.2} | Order: {}",
                         market.label, pnl_pct, pnl_usd, order_result.order_id
                     );
+                    if let Some(loggers) = event_loggers {
+                        loggers.log_execution(EngineEvent::LiveExit {
+                            ts: timestamp,
+                            market_slug: market.slug.clone(),
+                            side: side_name.to_string(),
+                            price: exit_price,
+                            pnl_usd,
+                            order_id: Some(order_result.order_id.clone()),
+                        });
+                        if gatekeeper.emergency_halt {
+                            loggers.log_execution(EngineEvent::EmergencyHalt {
+                                ts: timestamp,
+                                market_slug: market.slug.clone(),
+                                daily_pnl: gatekeeper.daily_pnl,
+                                reason: "daily loss limit".to_string(),
+                            });
+                        }
+                    }
                     position.reset(timestamp, was_loss);
                 }
                 Err(err) => {

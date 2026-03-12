@@ -5,6 +5,9 @@ Decompose the 3,368-line [bot.rs](file:///c:/Users/mehul/OneDrive/Desktop/Studio
 > [!IMPORTANT]
 > Each phase is a standalone, compilable checkpoint. We never break `cargo build` or `cargo test` mid-phase.
 
+> [!NOTE]
+> Implementation status: phases 1 through 7 are now coded and smoke-verified in the Rust engine. Replay was exercised in both `event-by-event` and `live-parity1s` modes against local PMXT archives, and a short live `watch-btc --feed websocket` session produced structured market event logs. Remaining work is warning cleanup and deeper strategy validation, not missing phase implementation.
+
 ---
 
 ## Phase 1: Extract Discovery Module

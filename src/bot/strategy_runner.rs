@@ -1,6 +1,8 @@
 use crate::bot::candles::CandleEngine;
 use crate::bot::feed::DualSnapshot;
 use crate::bot::indicators::{IndicatorEngine, IndicatorState};
+use crate::bot::logging::{EngineEvent, EngineEventLoggers};
+use crate::bot::risk::GatekeeperState;
 use crate::bot::risk::{best_ask_price, decimal_to_f64, midpoint_price};
 use crate::bot::shadow::{handle_shadow_signals, ShadowPosition, ShadowStepResult};
 use crate::bot::signal::{EntrySignal, SignalEngine};
@@ -21,6 +23,8 @@ pub fn run_shadow_strategy_step(
     state_1m: &mut IndicatorState,
     state_5s: &mut IndicatorState,
     shadow: &mut ShadowPosition,
+    gatekeeper: &mut GatekeeperState,
+    event_loggers: Option<&EngineEventLoggers>,
 ) -> Option<ShadowStepResult> {
     let midpoint = midpoint_price(&dual_snapshot.yes)?;
     let simulated_volume =
@@ -94,11 +98,26 @@ pub fn run_shadow_strategy_step(
             EntrySignal::None
         };
 
+        if let Some(loggers) = event_loggers {
+            loggers.log_strategy(EngineEvent::StrategySignal {
+                ts: epoch_seconds,
+                market_slug: market_slug.to_string(),
+                midpoint,
+                entry: format!("{:?}", signal.entry),
+                exit: format!("{:?}", signal.exit),
+                detail: format!(
+                    "indicator={indicator_signal:?}, book={book_signal:?}, yes_ask={yes_ask:.4}, no_ask={no_ask:.4}"
+                ),
+            });
+        }
+
         shadow.position_size_usd = position_size_usd;
         return Some(handle_shadow_signals(
             &mut signal,
             dual_snapshot,
             shadow,
+            gatekeeper,
+            event_loggers,
             market_label,
             market_slug,
             market_start_ts,
