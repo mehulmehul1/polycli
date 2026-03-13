@@ -2,94 +2,113 @@
 
 ## Phase 0. Docs and contracts
 
-- [ ] Replace the generic Qlib plan with the strict build-order plan.
-- [ ] Add `docs/research_schema.md`.
-- [ ] Keep all schema names and command names synchronized across docs.
+- [x] Replace the generic Qlib plan with the strict build-order plan.
+- [x] Add `docs/research_schema.md`.
+- [x] Keep all schema names and command names synchronized across docs.
+
+## Phase 0.5. Design docs (strategy, fair-value, execution)
+
+- [x] Add `docs/strategy_engine_spec.md`.
+- [x] Add `docs/fair_value_model.md`.
+- [x] Add `docs/execution_spec.md`.
+- [x] Review and approve all design docs before implementation.
+- [x] Update `docs/qlib_integration_plan.md` to reference new design docs.
 
 ## Phase 1. Rust research scaffold
 
-- [ ] Create `src/bot/research/mod.rs`.
-- [ ] Create `src/bot/research/config.rs`.
-- [ ] Create `src/bot/research/schema.rs`.
-- [ ] Create `src/bot/research/market_spec.rs`.
-- [ ] Create `src/bot/research/feature_export.rs`.
-- [ ] Create `src/bot/research/labeling.rs`.
-- [ ] Create `src/bot/research/cost_model.rs`.
+- [x] Create `src/bot/research/mod.rs`.
+- [x] Create `src/bot/research/config.rs`.
+- [x] Create `src/bot/research/schema.rs`.
+- [x] Create `src/bot/research/market_spec.rs`.
+- [x] Create `src/bot/research/feature_export.rs`.
+- [x] Create `src/bot/research/labeling.rs`.
+- [x] Create `src/bot/research/cost_model.rs`.
 - [ ] Create `src/bot/research/reference_price.rs`.
-- [ ] Create `src/bot/research/score_loader.rs`.
-- [ ] Create `src/bot/research/fusion.rs`.
-- [ ] Export the module from `src/bot/mod.rs`.
+- [x] Create `src/bot/research/score_loader.rs`.
+- [x] Create `src/bot/research/fusion.rs`.
+- [x] Export the module from `src/bot/mod.rs`.
+
+## Phase 1b. Strategy Engine (NEW)
+
+- [x] Create `src/bot/strategy/mod.rs` with StrategyEngine trait.
+- [x] Create `src/bot/strategy/types.rs` with Direction, Confidence, StrategyDecision.
+- [x] Create `src/bot/strategy/heuristic.rs` migrating from signal.rs.
+- [x] Create `src/bot/strategy/risk.rs` with RiskGate.
+- [x] Create `src/bot/pricing/mod.rs`.
+- [x] Create `src/bot/pricing/fair_value.rs` with digital option approximation.
+- [x] Create `src/bot/pricing/volatility.rs` with realized vol calculator.
 
 ## Phase 2. CLI surface
 
-- [ ] Add `ExportFeatures` to `BotCommand`.
-- [ ] Add `InspectFeatures` to `BotCommand`.
-- [ ] Add `ExportManifest` to `BotCommand`.
-- [ ] Add `BacktestScores` to `BotCommand`.
-- [ ] Add `ScoreShadow` to `BotCommand`.
-- [ ] Add argument structs in the existing bot/pipeline command surface.
-- [ ] Wire dispatch in `src/commands/bot.rs`.
-- [ ] Add `--strategy <heuristic|qlib|fused>` where needed.
+- [x] Add `ExportFeatures` to `BotCommand`.
+- [x] Add `InspectFeatures` to `BotCommand`.
+- [x] Add `ExportManifest` to `BotCommand`.
+- [x] Add `BacktestScores` to `BotCommand`.
+- [x] Add `ScoreShadow` to `BotCommand`.
+- [x] Add argument structs in the existing bot/pipeline command surface.
+- [x] Wire dispatch in `src/commands/bot.rs`.
+- [x] Add `--strategy <heuristic|qlib|fused>` where needed.
 
 ## Phase 3. Market normalization
 
-- [ ] Implement `SupportedAsset`.
-- [ ] Implement `SupportedDuration`.
-- [ ] Implement `MarketFamily`.
-- [ ] Implement `CryptoBinaryMarketSpec`.
-- [ ] Parse market family from slug and metadata.
-- [ ] Parse `condition_id`, start time, and end time.
-- [ ] Skip unsupported markets with structured reasons.
+- [x] Implement `SupportedAsset`.
+- [x] Implement `SupportedDuration`.
+- [x] Implement `MarketFamily`.
+- [x] Implement `CryptoBinaryMarketSpec`.
+- [x] Parse market family from slug and metadata.
+- [x] Parse `condition_id`, start time, and end time.
+- [x] Skip unsupported markets with structured reasons.
 
 ## Phase 4. Feature export
 
-- [ ] Reuse PMXT archive readers from `src/bot/pipeline/mod.rs`.
-- [ ] Build canonical 1-second rows from PMXT raw archive events.
-- [ ] Emit feature parquet with schema from `docs/research_schema.md`.
-- [ ] Emit manifest JSON next to the parquet output.
-- [ ] Add deterministic ordering by `condition_id`, `ts`.
-- [ ] Add `inspect-features` sample printer.
+- [x] Reuse PMXT archive readers from `src/bot/pipeline/mod.rs`.
+- [x] Build canonical 1-second rows from PMXT raw archive events.
+- [x] Emit feature parquet with schema from `docs/research_schema.md`.
+- [x] Emit manifest JSON next to the parquet output.
+- [x] Add deterministic ordering by `condition_id`, `ts`.
+- [x] Add `inspect-features` sample printer.
 
 ## Phase 5. Cost model
 
-- [ ] Implement one shared fee helper in Rust.
-- [ ] Express all labels in net price points after fees.
-- [ ] Add slippage buffer config to the cost helper.
-- [ ] Add tests for low-price and high-price fee scenarios.
+- [x] Implement one shared fee helper in Rust.
+- [x] Express all labels in net price points after fees.
+- [x] Add slippage buffer config to the cost helper.
+- [x] Add tests for low-price and high-price fee scenarios.
 
 ## Phase 6. Labels
 
-- [ ] Compute reachable-profit labels for YES.
-- [ ] Compute reachable-profit labels for NO.
-- [ ] Compute max-edge labels for YES.
-- [ ] Compute max-edge labels for NO.
-- [ ] Compute adverse-excursion labels.
-- [ ] Ensure no feature column reads future values.
-- [ ] Add label tests for empty horizon and illiquid edge cases.
+- [x] Compute reachable-profit labels for YES.
+- [x] Compute reachable-profit labels for NO.
+- [x] Compute max-edge labels for YES.
+- [x] Compute max-edge labels for NO.
+- [x] Compute adverse-excursion labels.
+- [x] Ensure no feature column reads future values.
+- [x] Add label tests for empty horizon and illiquid edge cases.
 
 ## Phase 7. Score loading and fusion
 
-- [ ] Define `ScoreRow`.
-- [ ] Define `ScoreBundle`.
-- [ ] Load score parquet from disk.
-- [ ] Validate model version and score schema version.
-- [ ] Validate score TTL and freshness.
-- [ ] Implement heuristic-only mode.
-- [ ] Implement qlib-only mode.
-- [ ] Implement fused mode.
-- [ ] Add replay comparison output for all three modes.
+- [x] Define `ScoreRow`.
+- [x] Define `ScoreBundle`.
+- [x] Load score parquet from disk.
+- [x] Validate model version and score schema version.
+- [x] Validate score TTL and freshness.
+- [x] Implement heuristic-only mode.
+- [x] Implement qlib-only mode.
+- [x] Implement fused mode.
+- [x] Add replay comparison output for all three modes.
 
 ## Phase 8. Research workspace
 
-- [ ] Create `research/qlib/README.md`.
-- [ ] Create `research/qlib/requirements.txt`.
-- [ ] Create `research/qlib/config.py`.
-- [ ] Create `research/qlib/build_dataset.py`.
-- [ ] Create `research/qlib/train.py`.
-- [ ] Create `research/qlib/evaluate.py`.
-- [ ] Create `research/qlib/export_scores.py`.
-- [ ] Create `research/qlib/handlers/polymarket_handler.py`.
-- [ ] Create `research/qlib/tasks/`.
+- [x] Create `research/qlib/README.md`.
+- [x] Create `research/qlib/requirements.txt`.
+- [x] Create `research/qlib/config.py`.
+- [x] Create `research/qlib/build_dataset.py`.
+- [x] Create `research/qlib/train.py`.
+- [x] Create `research/qlib/evaluate.py`.
+- [x] Create `research/qlib/export_scores.py`.
+- [x] Create `research/qlib/handlers/polymarket_handler.py`.
+- [x] Create `research/qlib/tasks/`.
+- [x] Create `research/qlib/splits.py` for rolling validation.
 
 ## Phase 9. Baseline models
 
@@ -112,19 +131,19 @@
 
 ## Phase 11. Rolling validation
 
-- [ ] Add rolling split generation in Python.
-- [ ] Default to `30d/7d/7d`.
-- [ ] Fall back to `14d/3d/3d` for thin data.
-- [ ] Save segment definitions in manifest JSON.
-- [ ] Keep train, valid, and test windows strictly time-ordered.
+- [x] Add rolling split generation in Python.
+- [x] Default to `30d/7d/7d`.
+- [x] Fall back to `14d/3d/3d` for thin data.
+- [x] Save segment definitions in manifest JSON.
+- [x] Keep train, valid, and test windows strictly time-ordered.
 
 ## Phase 12. Shadow integration
 
-- [ ] Add `score-shadow` runner in Rust.
-- [ ] Log heuristic, qlib, and fused decisions side by side.
-- [ ] Log score freshness and fallback reasons.
-- [ ] Keep Qlib optional at runtime.
-- [ ] Do not execute live trades from Qlib-only mode in v1.
+- [x] Add `score-shadow` runner in Rust.
+- [x] Log heuristic, qlib, and fused decisions side by side.
+- [x] Log score freshness and fallback reasons.
+- [x] Keep Qlib optional at runtime.
+- [x] Do not execute live trades from Qlib-only mode in v1.
 
 ## Phase 13. Final acceptance
 
@@ -136,8 +155,7 @@
 
 ## Immediate next tasks
 
-- [ ] Implement `src/bot/research/schema.rs`.
-- [ ] Implement `ExportFeaturesArgs`.
-- [ ] Implement `polymarket bot export-features`.
-- [ ] Write `docs/research_schema.md` to match the export.
-- [ ] Add one baseline Python dataset loader and trainer.
+- [ ] Run `cargo check` and fix any remaining compilation errors
+- [ ] Wire `strategy_runner.rs` to use new StrategyEngine trait
+- [ ] Update `shadow.rs` for fusion logging
+- [ ] Train baseline models with Python scripts

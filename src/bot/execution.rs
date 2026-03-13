@@ -1,3 +1,7 @@
+//! Execution Module
+//!
+//! Order execution, fill handling, and feed health monitoring.
+
 use crate::bot::discovery::{WatchedMarket, FIVE_MINUTES_SECONDS, fetch_snapshot};
 use crate::bot::feed::DualSnapshot;
 use crate::bot::logging::{EngineEvent, EngineEventLoggers};
@@ -7,6 +11,7 @@ use crate::bot::risk::{
 };
 use crate::bot::shadow::TokenSide;
 use crate::bot::signal::{EntrySignal, ExitSignal};
+use crate::bot::strategy::Direction;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use polymarket_client_sdk::auth::state::Authenticated;
@@ -15,6 +20,127 @@ use polymarket_client_sdk::clob;
 use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk::clob::types::{Side, OrderType, AssetType, Amount};
 use polymarket_client_sdk::types::{Decimal, U256};
+use serde::{Deserialize, Serialize};
+
+// ============================================================================
+// Execution Types (from execution_spec.md)
+// ============================================================================
+
+/// Order type for execution
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderTypeExt {
+    /// Fill-or-Kill: must fill completely or cancel
+    FOK,
+    /// Fill-and-Kill (Immediate-or-Cancel): partial fills allowed, remainder cancelled
+    FAK,
+    /// Good-Til-Cancelled: stays on book until filled or cancelled
+    GTC,
+    /// Good-Til-Date: stays until time expires
+    GTD { expiry_ts: u64 },
+}
+
+/// Order side
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderSide {
+    Buy,
+    Sell,
+}
+
+/// Order request from strategy
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderRequest {
+    pub market_slug: String,
+    pub condition_id: String,
+    pub direction: Direction,
+    pub side: OrderSide,
+    pub price: f64,
+    pub size_usd: f64,
+    pub order_type: OrderTypeExt,
+    pub ts: u64,
+}
+
+/// Fill result from exchange
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FillResult {
+    pub order_id: String,
+    pub market_slug: String,
+    pub direction: Direction,
+    pub side: OrderSide,
+    pub filled_price: f64,
+    pub filled_size_usd: f64,
+    pub remaining_size_usd: f64,
+    pub fee_usd: f64,
+    pub ts: u64,
+    pub is_complete: bool,
+}
+
+/// Position after fill confirmation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfirmedPosition {
+    pub condition_id: String,
+    pub direction: Direction,
+    pub entry_ts: u64,
+    pub entry_price: f64,
+    pub size_usd: f64,
+    pub entry_order_id: String,
+    pub current_value_usd: f64,
+    pub unrealized_pnl_usd: f64,
+}
+
+/// Execution mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionMode {
+    /// Paper trading (no real orders)
+    Shadow,
+    /// Dry run (submit to API but don't execute)
+    DryRun,
+    /// Live execution
+    Live,
+}
+
+/// Feed health status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FeedHealth {
+    Healthy,
+    Stale { age_s: u64 },
+    Disconnected,
+}
+
+impl FeedHealth {
+    pub fn is_healthy(&self, max_stale_s: u64) -> bool {
+        match self {
+            FeedHealth::Healthy => true,
+            FeedHealth::Stale { age_s } => *age_s <= max_stale_s,
+            FeedHealth::Disconnected => false,
+        }
+    }
+    
+    pub fn is_tradeable(&self, market_duration_s: i64) -> bool {
+        match self {
+            FeedHealth::Healthy => true,
+            FeedHealth::Stale { age_s } => {
+                // For short markets, any staleness is unacceptable
+                market_duration_s > 300 || *age_s < 2
+            }
+            FeedHealth::Disconnected => false,
+        }
+    }
+}
+
+/// Fill intent for order routing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillIntent {
+    /// Immediate fill (FAK/IOC)
+    Immediate,
+    /// Patient fill (GTC with patience)
+    Patient,
+    /// Must fill completely (FOK)
+    Complete,
+}
+
+// ============================================================================
+// Existing Types
+// ============================================================================
 
 pub struct PendingSettlement {
     pub market_slug: String,

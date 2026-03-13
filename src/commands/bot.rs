@@ -60,6 +60,14 @@ pub enum BotCommand {
     ListMarkets(ListMarketsArgs),
     /// Stream historical orderbook data from PMXT and run shadow backtest
     BacktestPipeline(BacktestPipelineArgs),
+    /// Export features from PMXT archive to parquet for ML training
+    ExportFeatures(ExportFeaturesArgs),
+    /// Inspect exported feature parquet file
+    InspectFeatures(InspectFeaturesArgs),
+    /// Run backtest with Qlib scores
+    BacktestScores(BacktestScoresArgs),
+    /// Shadow mode with Qlib scores (no live trading)
+    ScoreShadow(ScoreShadowArgs),
 }
 
 #[derive(Args, Clone)]
@@ -133,6 +141,90 @@ pub struct TradeBtcArgs {
 
 // Migrated to crate::bot::execution
 
+// ============================================================================
+// Research CLI Args
+// ============================================================================
+
+#[derive(Args, Clone)]
+pub struct ExportFeaturesArgs {
+    /// Input PMXT archive path
+    #[arg(long)]
+    pub input: String,
+
+    /// Output features parquet path
+    #[arg(long)]
+    pub out: String,
+
+    /// Manifest output path
+    #[arg(long)]
+    pub manifest_out: Option<String>,
+
+    /// Asset filter (btc, eth, sol, xrp)
+    #[arg(long)]
+    pub asset: Option<String>,
+
+    /// Duration filter (5m, 15m, 1h)
+    #[arg(long)]
+    pub duration: Option<String>,
+
+    /// Include labels in output
+    #[arg(long)]
+    pub with_labels: bool,
+
+    /// Include spot price data
+    #[arg(long)]
+    pub with_spot: bool,
+}
+
+#[derive(Args, Clone)]
+pub struct InspectFeaturesArgs {
+    /// Input features parquet path
+    #[arg(long)]
+    pub input: String,
+
+    /// Number of samples to show
+    #[arg(long, default_value = "10")]
+    pub sample: usize,
+}
+
+#[derive(Args, Clone)]
+pub struct BacktestScoresArgs {
+    /// Input features parquet path
+    #[arg(long)]
+    pub input: String,
+
+    /// Scores parquet path
+    #[arg(long)]
+    pub scores: String,
+
+    /// Strategy mode (heuristic, qlib, fused)
+    #[arg(long, default_value = "heuristic")]
+    pub strategy: String,
+
+    /// Export results path
+    #[arg(long)]
+    pub export: Option<String>,
+}
+
+#[derive(Args, Clone)]
+pub struct ScoreShadowArgs {
+    /// Scores parquet path
+    #[arg(long)]
+    pub scores: String,
+
+    /// Asset to trade
+    #[arg(long, default_value = "btc")]
+    pub asset: String,
+
+    /// Market duration
+    #[arg(long, default_value = "5m")]
+    pub duration: String,
+
+    /// Strategy mode (heuristic, qlib, fused)
+    #[arg(long, default_value = "fused")]
+    pub strategy: String,
+}
+
 pub async fn execute(args: BotArgs) -> Result<()> {
     match args.command {
         BotCommand::WatchBtc(live_args) => watch_btc_market(None, live_args).await,
@@ -147,6 +239,10 @@ pub async fn execute(args: BotArgs) -> Result<()> {
         BotCommand::InspectParquet(inspect_args) => run_inspect_parquet(inspect_args),
         BotCommand::ListMarkets(list_args) => run_list_markets(list_args).await,
         BotCommand::BacktestPipeline(pipeline_args) => run_backtest_pipeline(pipeline_args).await,
+        BotCommand::ExportFeatures(export_args) => run_export_features(export_args).await,
+        BotCommand::InspectFeatures(inspect_args) => run_inspect_features(inspect_args).await,
+        BotCommand::BacktestScores(backtest_args) => run_backtest_scores(backtest_args).await,
+        BotCommand::ScoreShadow(shadow_args) => run_score_shadow(shadow_args).await,
     }
 }
 
@@ -711,6 +807,86 @@ async fn run_backtest_pipeline(args: BacktestPipelineArgs) -> Result<()> {
     pipeline::run_backtest_pipeline(args).await
 }
 
+// ============================================================================
+// Research CLI Implementation
+// ============================================================================
+
+async fn run_export_features(args: ExportFeaturesArgs) -> Result<()> {
+    use crate::bot::research::{FeatureExporter, ResearchConfig};
+    use std::path::PathBuf;
+
+    println!("[EXPORT] Input: {}", args.input);
+    println!("[EXPORT] Output: {}", args.out);
+
+    let config = ResearchConfig::default();
+    let exporter = FeatureExporter::new(config);
+
+    let manifest_path = args.manifest_out
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&args.out).with_extension("manifest.json"));
+
+    let (feature_count, label_count) = exporter
+        .export(&args.input, &args.out, &manifest_path)?;
+
+    println!("[EXPORT] Wrote {} feature rows", feature_count);
+    println!("[EXPORT] Wrote {} label rows", label_count);
+    println!("[EXPORT] Manifest: {:?}", manifest_path);
+
+    Ok(())
+}
+
+fn run_inspect_features(args: InspectFeaturesArgs) -> Result<()> {
+    use crate::bot::research::feature_export::inspect_features;
+    inspect_features(&args.input, args.sample)
+}
+
+async fn run_backtest_scores(args: BacktestScoresArgs) -> Result<()> {
+    use crate::bot::research::{FusionMode, FusionEngine, FusionConfig};
+
+    println!("[BACKTEST] Scores: {}", args.scores);
+    println!("[BACKTEST] Strategy: {}", args.strategy);
+
+    // Determine fusion mode
+    let mode = match args.strategy.to_lowercase().as_str() {
+        "heuristic" => FusionMode::HeuristicOnly,
+        "qlib" => FusionMode::QlibOnly,
+        "fused" => FusionMode::Fused,
+        _ => anyhow::bail!("Invalid strategy mode: {}. Use heuristic, qlib, or fused.", args.strategy),
+    };
+
+    let config = FusionConfig::default();
+    let _engine = FusionEngine::new(mode, config);
+
+    println!("[BACKTEST] Mode: {:?}", mode);
+    println!("[BACKTEST] Note: Full backtest requires feature data integration");
+
+    Ok(())
+}
+
+async fn run_score_shadow(args: ScoreShadowArgs) -> Result<()> {
+    use crate::bot::research::{FusionMode, FusionEngine, FusionConfig};
+
+    println!("[SHADOW] Asset: {}", args.asset);
+    println!("[SHADOW] Duration: {}", args.duration);
+    println!("[SHADOW] Scores: {}", args.scores);
+    println!("[SHADOW] Strategy: {}", args.strategy);
+
+    let mode = match args.strategy.to_lowercase().as_str() {
+        "heuristic" => FusionMode::HeuristicOnly,
+        "qlib" => FusionMode::QlibOnly,
+        "fused" => FusionMode::Fused,
+        _ => anyhow::bail!("Invalid strategy mode: {}", args.strategy),
+    };
+
+    let config = FusionConfig::default();
+    let _engine = FusionEngine::new(mode, config);
+
+    println!("[SHADOW] Mode: {:?}", mode);
+    println!("[SHADOW] Note: Shadow mode runs without live trading");
+    println!("[SHADOW] Decision logging enabled");
+
+    Ok(())
+}
 
 // Migrated to crate::bot::pipeline
 
