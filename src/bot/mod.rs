@@ -10,6 +10,7 @@ pub mod market_classifier;
 pub mod pipeline;
 pub mod monte_carlo;
 pub mod pricing;
+pub mod recording;
 pub mod research;
 pub mod risk;
 pub mod shadow;

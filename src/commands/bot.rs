@@ -94,6 +94,14 @@ pub struct LiveShadowArgs {
     /// Start the engine in an emergency-halted state
     #[arg(long)]
     pub emergency_halt: bool,
+
+    /// Record all orderbook ticks to CSV for later backtesting
+    #[arg(long)]
+    pub record: bool,
+
+    /// Directory to save recordings (default: recordings/)
+    #[arg(long, default_value = "recordings")]
+    pub recordings_dir: String,
 }
 
 
@@ -321,6 +329,14 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
     println!("[SHADOW MODE] Feed: {:?}", live_args.feed);
     println!("========================================");
 
+    // Create tick recorder if --record flag is set
+    let mut recorder = if live_args.record {
+        Some(crate::bot::recording::TickRecorder::new(&live_args.recordings_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to create recorder: {}", e))?)
+    } else {
+        None
+    };
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -432,6 +448,20 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
                     let epoch_seconds = input_source
                         .current_time()
                         .unwrap_or_else(|| dual_snapshot.ts_exchange.floor() as u64);
+
+                    // Record tick if recording is enabled
+                    if let Some(ref mut rec) = recorder {
+                        let time_remaining = (watched.end_time.timestamp() - epoch_seconds as i64).max(0);
+                        rec.record_tick(
+                            dual_snapshot.ts_exchange,
+                            &watched.slug,
+                            last_yes_bid,
+                            best_ask_price(&dual_snapshot.yes).unwrap_or(0.0),
+                            last_no_bid,
+                            best_ask_price(&dual_snapshot.no).unwrap_or(0.0),
+                            time_remaining,
+                        );
+                    }
 
                     if let Some(loggers) = &event_loggers {
                         loggers.log_market(EngineEvent::BookUpdate {

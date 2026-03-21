@@ -1501,6 +1501,49 @@ pub async fn run_backtest_pipeline(args: BacktestPipelineArgs) -> Result<()> {
     Ok(())
 }
 
+/// Read a CSV recording file and group rows by market_slug.
+/// Returns a map of market_slug -> Vec<ReplayRow>.
+fn read_csv_recordings(path: &str) -> Result<Vec<(String, Vec<ReplayRow>)>> {
+    use std::collections::HashMap;
+
+    let mut reader = csv::Reader::from_path(path)?;
+    let mut markets: HashMap<String, Vec<ReplayRow>> = HashMap::new();
+
+    for result in reader.records() {
+        let record = result?;
+        // Columns: timestamp, market_slug, yes_bid, yes_ask, no_bid, no_ask, time_remaining
+        let timestamp: f64 = record.get(0).unwrap_or("0").parse().unwrap_or(0.0);
+        let market_slug = record.get(1).unwrap_or("unknown").to_string();
+        let yes_bid: f64 = record.get(2).unwrap_or("0").parse().unwrap_or(0.0);
+        let yes_ask: f64 = record.get(3).unwrap_or("0").parse().unwrap_or(0.0);
+        let no_bid: f64 = record.get(4).unwrap_or("0").parse().unwrap_or(0.0);
+        let no_ask: f64 = record.get(5).unwrap_or("0").parse().unwrap_or(0.0);
+
+        // Add YES side tick
+        markets.entry(market_slug.clone()).or_default().push(ReplayRow {
+            ts: timestamp,
+            side: "YES".to_string(),
+            bid: yes_bid,
+            ask: yes_ask,
+        });
+        // Add NO side tick
+        markets.entry(market_slug).or_default().push(ReplayRow {
+            ts: timestamp,
+            side: "NO".to_string(),
+            bid: no_bid,
+            ask: no_ask,
+        });
+    }
+
+    // Sort each market's ticks by timestamp
+    for rows in markets.values_mut() {
+        rows.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    let result: Vec<(String, Vec<ReplayRow>)> = markets.into_iter().collect();
+    Ok(result)
+}
+
 pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
     use std::path::Path;
     use std::collections::HashSet;
@@ -1511,24 +1554,40 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
         anyhow::bail!("Not a directory: {}", args.input_dir);
     }
 
-    let mut parquet_files: Vec<(String, i64)> = Vec::new();
+    let mut input_files: Vec<(String, i64, bool)> = Vec::new(); // (path, sort_key, is_csv)
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
-            if let Some(ts) = extract_hour_from_filename(&path.to_string_lossy()) {
-                parquet_files.push((path.to_string_lossy().to_string(), ts));
+        let ext = path.extension().and_then(|e| e.to_str());
+        let path_str = path.to_string_lossy().to_string();
+        match ext {
+            Some("parquet") => {
+                if let Some(ts) = extract_hour_from_filename(&path_str) {
+                    input_files.push((path_str, ts, false));
+                }
             }
+            Some("csv") => {
+                // Use file modification time as sort key for CSV files
+                let sort_key = entry.metadata()
+                    .and_then(|m| m.modified())
+                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
+                    .unwrap_or(0);
+                input_files.push((path_str, sort_key, true));
+            }
+            _ => {}
         }
     }
 
-    if parquet_files.is_empty() {
-        anyhow::bail!("No parquet files found in {}", args.input_dir);
+    if input_files.is_empty() {
+        anyhow::bail!("No parquet or CSV files found in {}", args.input_dir);
     }
 
     // Sort by timestamp
-    parquet_files.sort_by_key(|(_, ts)| *ts);
-    println!("[BACKTEST-PMXT] Found {} parquet files (sorted chronologically)", parquet_files.len());
+    input_files.sort_by_key(|(_, ts, _)| *ts);
+    let parquet_count = input_files.iter().filter(|(_, _, csv)| !csv).count();
+    let csv_count = input_files.iter().filter(|(_, _, csv)| *csv).count();
+    println!("[BACKTEST-PMXT] Found {} files ({} parquet, {} CSV) (sorted chronologically)",
+        input_files.len(), parquet_count, csv_count);
     println!("[BACKTEST-PMXT] Strategy: {:?}", args.strategy);
     println!("[BACKTEST-PMXT] Starting capital: ${:.2}", args.capital);
 
@@ -1553,16 +1612,143 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
     let mut cumulative_losses: Vec<f64> = Vec::new();
     let mut bankroll_history: Vec<(String, f64)> = Vec::new(); // (slug, bankroll after market)
 
-    for (file_path, file_ts) in &parquet_files {
+    for (file_path, file_ts, is_csv) in &input_files {
         file_num += 1;
-        let hour_label = chrono::DateTime::from_timestamp(*file_ts, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-            .unwrap_or_else(|| format!("ts={}", file_ts));
+        let label = if *is_csv {
+            std::path::Path::new(file_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| file_path.clone())
+        } else {
+            chrono::DateTime::from_timestamp(*file_ts, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| format!("ts={}", file_ts))
+        };
 
-        println!("\n[FILE {}/{}] {} — {}", file_num, parquet_files.len(), hour_label, file_path);
+        println!("\n[FILE {}/{}] {} — {}", file_num, input_files.len(), label, file_path);
 
-        // Discover markets in this file (uses Gamma API to verify BTC 5m)
-        let discovered = match discover_markets_for_input(&conn, file_path, args.min_ticks, args.crypto, Some(&args.filter), args.verbose).await {
+        if *is_csv {
+            // CSV recording file: read directly, group by market
+            let csv_markets = match read_csv_recordings(file_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("  [WARN] Failed to read CSV {}: {}", file_path, e);
+                    continue;
+                }
+            };
+
+            for (market_slug, replay_rows) in csv_markets {
+                if !processed_markets.insert(market_slug.clone()) {
+                    continue;
+                }
+
+                metrics.total_markets += 1;
+
+                // Estimate start/end times from the data
+                let min_ts = replay_rows.iter().map(|r| r.ts).fold(f64::INFINITY, f64::min);
+                let max_ts = replay_rows.iter().map(|r| r.ts).fold(f64::NEG_INFINITY, f64::max);
+                let start_ts = (min_ts.floor() as i64) - ((min_ts.floor() as i64) % 300);
+                let end_ts = start_ts + 300;
+
+                let discovered = DiscoveredMarket {
+                    condition_id: market_slug.clone(),
+                    slug: market_slug.clone(),
+                    question: format!("Recorded: {}", market_slug),
+                    start_ts,
+                    end_ts,
+                    ticks: replay_rows.len() as i64,
+                    min_ts,
+                    max_ts,
+                };
+
+                // Fresh state per market
+                let mut candle_engine = CandleEngine::new();
+                let mut ind_1m = IndicatorEngine::new();
+                let mut ind_5s = IndicatorEngine::new();
+                let mut signal_engine = SignalEngine::new_with_band(band_low, band_high);
+                let mut state_1m = IndicatorState::default();
+                let mut state_5s = IndicatorState::default();
+                let mut gatekeeper = GatekeeperState::new(args.size * 3.0, 15);
+                shadow.full_reset();
+                let mut fv_model = LogitJumpDiffusion::new();
+                let mut fv_kalman = Some(KalmanFilter::new(0.0));
+                let mut fv_jump_calibrator = Some(JumpCalibrator::with_defaults());
+                let mut fv_calibrated = {
+                    let base_model = FairValueModel::default();
+                    CalibratedFairValue::with_defaults(base_model)
+                };
+
+                let snapshots = build_replay_snapshots(&replay_rows, ReplayMode::EventByEvent);
+                let mut replay_source = ReplaySnapshotSource::new(snapshots);
+
+                let mut last_yes_bid = 0.0;
+                let mut last_no_bid = 0.0;
+
+                while let Some(snapshot) = replay_source.next_snapshot().await? {
+                    last_yes_bid = snapshot.yes.best_bid.map(decimal_to_f64).unwrap_or(last_yes_bid);
+                    last_no_bid = snapshot.no.best_bid.map(decimal_to_f64).unwrap_or(last_no_bid);
+                    let epoch_seconds = replay_source
+                        .current_time()
+                        .unwrap_or_else(|| snapshot.ts_exchange.floor() as u64);
+
+                    if args.strategy == BtStrategy::FairValue {
+                        process_fairvalue_snapshot(
+                            &mut fv_model,
+                            &mut fv_kalman,
+                            &mut fv_jump_calibrator,
+                            &mut fv_calibrated,
+                            &snapshot,
+                            epoch_seconds,
+                            discovered.start_ts,
+                            discovered.end_ts,
+                            &mut shadow,
+                            &mut metrics,
+                            args.size,
+                            args.min_edge,
+                            args.verbose,
+                            &mut cumulative_wins,
+                            &mut cumulative_losses,
+                        );
+                    } else {
+                        if let Some(step) = process_pipeline_snapshot(
+                            &discovered, &snapshot, epoch_seconds,
+                            &mut candle_engine, &mut ind_1m, &mut ind_5s,
+                            &mut signal_engine, &mut state_1m, &mut state_5s,
+                            &mut shadow, &mut gatekeeper, &mut metrics,
+                            args.size, args.verbose, None,
+                        ) {
+                            if let Some(exit_trade) = step.exit_trade {
+                                if exit_trade.pnl_usd >= 0.0 { cumulative_wins.push(exit_trade.pnl_usd); }
+                                else { cumulative_losses.push(exit_trade.pnl_usd); }
+                            }
+                        }
+                    }
+                }
+
+                // Settle open position
+                if shadow.is_active() {
+                    let side_bid = if shadow.token_side == Some(TokenSide::Yes) { last_yes_bid } else { last_no_bid };
+                    let settlement = if side_bid > 0.5 { 1.0 } else { 0.0 };
+                    let pnl = shadow.pnl(settlement) * shadow.position_size_usd;
+                    shadow.bankroll_usd += shadow.position_size_usd + pnl;
+                    metrics.trades_taken += 1;
+                    if pnl >= 0.0 { metrics.wins += 1; cumulative_wins.push(pnl); }
+                    else { metrics.losses += 1; cumulative_losses.push(pnl); }
+                    shadow.reset(end_ts as u64);
+                }
+
+                bankroll_history.push((market_slug.clone(), shadow.bankroll_usd));
+                if shadow.bankroll_usd > metrics.peak_capital { metrics.peak_capital = shadow.bankroll_usd; }
+                let dd = (metrics.peak_capital - shadow.bankroll_usd) / metrics.peak_capital;
+                if dd > metrics.max_drawdown { metrics.max_drawdown = dd; }
+
+                if args.verbose {
+                    println!("  {} | Bankroll: ${:.2} | Ticks: {}", market_slug, shadow.bankroll_usd, replay_rows.len());
+                }
+            }
+        } else {
+            // Parquet file: use DuckDB + Gamma API discovery
+            let discovered = match discover_markets_for_input(&conn, file_path, args.min_ticks, args.crypto, Some(&args.filter), args.verbose).await {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("  [WARN] Discovery failed for {}: {}", file_path, e);
@@ -1745,6 +1931,7 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
                 println!("  {} | Bankroll: ${:.2} | Ticks: {}", market.slug, shadow.bankroll_usd, market.ticks);
             }
         }
+        } // end else (parquet processing)
     }
 
     // Final metrics
@@ -1754,7 +1941,7 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
 
     // Print enhanced summary
     println!("\n================ BACKTEST-PMXT SUMMARY ================");
-    println!("Files Processed:    {}", parquet_files.len());
+    println!("Files Processed:    {}", input_files.len());
     println!("Markets Processed:  {}", metrics.total_markets);
     println!("Total Ticks:        {}", metrics.total_ticks);
     println!("Trades Taken:       {}", metrics.trades_taken);
@@ -1804,7 +1991,7 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
             bankroll_history: Vec<(String, f64)>,
         }
         let result = ExportResult {
-            files_processed: parquet_files.len(),
+            files_processed: input_files.len(),
             markets_processed: metrics.total_markets,
             total_ticks: metrics.total_ticks,
             trades_taken: metrics.trades_taken,
