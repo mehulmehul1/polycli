@@ -1139,12 +1139,25 @@ pub fn process_pipeline_snapshot(
     None
 }
 
-use crate::bot::pricing::{LogitJumpDiffusion, LogitObservation, prob_to_logit, sigmoid};
+use crate::bot::pricing::{
+    CalibratedFairValue, FairValueModel, JumpCalibrator, KalmanFilter,
+    LogitJumpDiffusion, LogitObservation, sigmoid, prob_to_logit, risk_neutral_drift,
+};
 
-/// Process a single snapshot using the fair value logit model.
-/// Returns (entry_signal, exit_signal) where entry_signal is Some((direction, fair_prob, edge)).
+/// Process a single snapshot using the full FairValue pipeline:
+/// 1. Logit observation from market midpoint
+/// 2. Kalman filter for noise reduction
+/// 3. Jump calibrator (EM) for jump parameter estimation
+/// 4. Horizon classification for parameter adaptation
+/// 5. Fair probability via risk-neutral model
+/// 6. Calibrated edge with spread/book adjustment
+/// 7. Momentum gate (velocity + EMA alignment)
+/// 8. Entry/exit decisions
 pub fn process_fairvalue_snapshot(
     logit_model: &mut LogitJumpDiffusion,
+    kalman: &mut Option<KalmanFilter>,
+    jump_calibrator: &mut Option<JumpCalibrator>,
+    calibrated_fv: &mut CalibratedFairValue,
     snapshot: &DualSnapshot,
     epoch_seconds: u64,
     market_start_ts: i64,
@@ -1165,36 +1178,94 @@ pub fn process_fairvalue_snapshot(
         return;
     }
 
-    let spread = best_ask_price(&snapshot.yes).unwrap_or(0.5) - best_bid_price(&snapshot.yes).unwrap_or(0.5);
+    let yes_bid = best_bid_price(&snapshot.yes).unwrap_or(0.0);
+    let yes_ask = best_ask_price(&snapshot.yes).unwrap_or(1.0);
+    let no_bid = best_bid_price(&snapshot.no).unwrap_or(0.0);
+    let no_ask = best_ask_price(&snapshot.no).unwrap_or(1.0);
+    let spread = (yes_ask - yes_bid).max(0.001);
+    let book_sum = yes_ask + no_ask;
 
-    // Create observation
+    // Step 1: Create logit observation
+    let clamped_prob = yes_mid.clamp(0.01, 0.99);
+    let raw_logit = prob_to_logit(clamped_prob);
+
     let obs = LogitObservation {
         timestamp: epoch_seconds as i64,
-        prob: yes_mid,
-        logit: prob_to_logit(yes_mid.clamp(0.01, 0.99)),
+        prob: clamped_prob,
+        logit: raw_logit,
         spread,
         volume: 0.0,
     };
 
-    // Update model
-    let _filtered = logit_model.update(&obs);
+    // Step 2: Update logit model (exponential filter)
+    let filtered = logit_model.update(&obs);
 
-    // Compute fair probability
+    // Step 3: Kalman filter for noise reduction
+    let kalman_logit = if let Some(kf) = kalman {
+        kf.set_measurement_noise(spread);
+        let dt = 1.0 / (365.25 * 24.0 * 3600.0); // ~1 second in years
+        let drift = risk_neutral_drift(filtered.logit, filtered.vol, 0.0);
+        kf.predict(dt, drift, filtered.vol);
+        kf.update(raw_logit, spread);
+        kf.state()
+    } else {
+        filtered.logit
+    };
+
+    // Step 4: Update jump calibrator (EM estimation)
+    if let Some(jc) = jump_calibrator {
+        jc.update(&obs);
+    }
+
+    // Step 5: Horizon classification
+    let horizon = crate::bot::market_classifier::classify_market(time_remaining);
+    let edge_multiplier = horizon.edge_multiplier();
+
+    // Step 6: Compute fair probability via risk-neutral model
     let fair = logit_model.fair_prob(time_remaining);
     let fair_prob = fair.expected;
 
-    // Edge calculation (includes 2.5% trading cost)
+    // Step 7: Edge calculation (use raw fair probability + spread adjustment)
+    let spread_cost = (yes_ask - yes_bid) * 0.5;  // half spread as cost
+    let book_inefficiency = 1.0 - book_sum;  // book_sum < 1.0 means cheap
+    let adjusted_fair = (fair_prob - spread_cost + book_inefficiency * 0.1).clamp(0.01, 0.99);
+
+    let edge_yes = (adjusted_fair - yes_ask) * edge_multiplier;
+    let edge_no = ((1.0 - adjusted_fair) - no_ask) * edge_multiplier;
+
+    // Step 8: Momentum gate (EMA alignment from indicators)
+    // Use the filtered logit converted back to probability for EMA comparison
+    let filtered_prob = sigmoid(kalman_logit);
+    let ema_fast = filtered_prob;  // Use filtered probability as "fast EMA"
+    let ema_slow = clamped_prob;   // Raw market midpoint as "slow EMA"
+    let velocity = filtered_prob - clamped_prob;  // Direction of movement
+
+    let momentum_allows_yes = velocity > -0.002 && ema_fast >= (ema_slow - 0.002);
+    let momentum_allows_no = velocity < 0.002 && ema_fast <= (ema_slow + 0.002);
+
+    // Step 9: Jump detection
+    let is_jump = if let Some(jc) = jump_calibrator {
+        let dt = 1.0 / (365.25 * 24.0 * 3600.0);
+        jc.is_jump(kalman_logit, dt, 2.0)
+    } else {
+        false
+    };
+
+    // Trading cost
     let trading_cost = 0.025;
-    let yes_ask = best_ask_price(&snapshot.yes).unwrap_or(1.0);
-    let no_ask = best_ask_price(&snapshot.no).unwrap_or(1.0);
 
-    let edge_yes = fair_prob - yes_ask - trading_cost;
-    let edge_no = (1.0 - fair_prob) - no_ask - trading_cost;
-
-    // Entry logic
+    // ── Entry Logic ──
     if !shadow.is_active() {
-        if edge_yes > min_edge && yes_ask < 0.95 && yes_ask > 0.05 {
-            // BUY YES
+        let effective_min_edge = min_edge * edge_multiplier;
+
+        // YES entry: calibrated edge + momentum + no extreme price + no jump
+        if edge_yes > effective_min_edge
+            && momentum_allows_yes
+            && !is_jump
+            && yes_ask < 0.95
+            && yes_ask > 0.05
+            && time_remaining > 30
+        {
             shadow.token_side = Some(TokenSide::Yes);
             shadow.active_entry = Some(EntrySignal::Long);
             shadow.entry_price = yes_ask;
@@ -1203,11 +1274,18 @@ pub fn process_fairvalue_snapshot(
             shadow.bankroll_usd -= position_size_usd;
             shadow.entry_timestamp = epoch_seconds;
             if verbose {
-                println!("[FV ENTRY] YES @ {:.4} | Fair: {:.4} | Edge: {:.4} | Bankroll: ${:.2}",
-                    yes_ask, fair_prob, edge_yes, shadow.bankroll_usd);
+                println!("[FV ENTRY] YES @ {:.4} | Fair: {:.4} | Adj: {:.4} | Edge: {:.4}x{:.1} | Horizon: {} | Jump: {} | Bankroll: ${:.2}",
+                    yes_ask, fair_prob, adjusted_fair, edge_yes, edge_multiplier, horizon.name(), is_jump, shadow.bankroll_usd);
             }
-        } else if edge_no > min_edge && no_ask < 0.95 && no_ask > 0.05 {
-            // BUY NO
+        }
+        // NO entry
+        else if edge_no > effective_min_edge
+            && momentum_allows_no
+            && !is_jump
+            && no_ask < 0.95
+            && no_ask > 0.05
+            && time_remaining > 30
+        {
             shadow.token_side = Some(TokenSide::No);
             shadow.active_entry = Some(EntrySignal::Short);
             shadow.entry_price = no_ask;
@@ -1216,13 +1294,13 @@ pub fn process_fairvalue_snapshot(
             shadow.bankroll_usd -= position_size_usd;
             shadow.entry_timestamp = epoch_seconds;
             if verbose {
-                println!("[FV ENTRY] NO @ {:.4} | Fair(YES): {:.4} | Edge: {:.4} | Bankroll: ${:.2}",
-                    no_ask, fair_prob, edge_no, shadow.bankroll_usd);
+                println!("[FV ENTRY] NO @ {:.4} | Fair(YES): {:.4} | Adj: {:.4} | Edge: {:.4}x{:.1} | Horizon: {} | Jump: {} | Bankroll: ${:.2}",
+                    no_ask, fair_prob, adjusted_fair, edge_no, edge_multiplier, horizon.name(), is_jump, shadow.bankroll_usd);
             }
         }
     }
 
-    // Exit logic
+    // ── Exit Logic ──
     if shadow.is_active() {
         let exit_price = match shadow.token_side {
             Some(TokenSide::Yes) => best_bid_price(&snapshot.yes),
@@ -1231,13 +1309,23 @@ pub fn process_fairvalue_snapshot(
         };
 
         let should_exit = if let Some(price) = exit_price {
-            // Exit if: edge reversed, or extreme price, or time almost up
             let current_edge = match shadow.token_side {
-                Some(TokenSide::Yes) => fair_prob - price,
-                Some(TokenSide::No) => (1.0 - fair_prob) - price,
+                Some(TokenSide::Yes) => adjusted_fair - price - trading_cost,
+                Some(TokenSide::No) => (1.0 - adjusted_fair) - price - trading_cost,
                 _ => 0.0,
             };
-            current_edge < 0.0 || price > 0.95 || price < 0.05 || time_remaining < 30
+
+            // Exit conditions:
+            // 1. Edge reversed (model now disagrees with position)
+            let edge_reversed = current_edge < 0.0;
+            // 2. Extreme price (near resolution)
+            let extreme_price = price > 0.95 || price < 0.05;
+            // 3. Time almost up
+            let time_up = time_remaining < 30;
+            // 4. Jump detected while holding (adverse event)
+            let jump_exit = is_jump && current_edge < 0.02;
+
+            edge_reversed || extreme_price || time_up || jump_exit
         } else {
             false
         };
@@ -1256,8 +1344,13 @@ pub fn process_fairvalue_snapshot(
                     cumulative_losses.push(dollar_pnl);
                 }
                 if verbose {
-                    println!("[FV EXIT] {:.4}% | ${:.4} | Bankroll: ${:.2}",
-                        pnl * 100.0, dollar_pnl, shadow.bankroll_usd);
+                    let exit_edge = match shadow.token_side {
+                        Some(TokenSide::Yes) => adjusted_fair - price - trading_cost,
+                        Some(TokenSide::No) => (1.0 - adjusted_fair) - price - trading_cost,
+                        _ => 0.0,
+                    };
+                    println!("[FV EXIT] {:.4}% | ${:.4} | Edge: {:.4} | Bankroll: ${:.2}",
+                        pnl * 100.0, dollar_pnl, exit_edge, shadow.bankroll_usd);
                 }
                 shadow.reset(epoch_seconds);
             }
@@ -1503,6 +1596,12 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
             let mut gatekeeper = GatekeeperState::new(args.size * 3.0, 15);
             shadow.full_reset();
             let mut fv_model = LogitJumpDiffusion::new();
+            let mut fv_kalman = Some(KalmanFilter::new(0.0));
+            let mut fv_jump_calibrator = Some(JumpCalibrator::with_defaults());
+            let mut fv_calibrated = {
+                let base_model = FairValueModel::default();
+                CalibratedFairValue::with_defaults(base_model)
+            };
 
             // Query ticks for this market
             let tick_sql = format!(
@@ -1560,9 +1659,12 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
                     .unwrap_or_else(|| snapshot.ts_exchange.floor() as u64);
 
                 if args.strategy == BtStrategy::FairValue {
-                    // Fair value strategy uses LogitJumpDiffusion model
+                    // Fair value strategy uses full logit pipeline
                     process_fairvalue_snapshot(
                         &mut fv_model,
+                        &mut fv_kalman,
+                        &mut fv_jump_calibrator,
+                        &mut fv_calibrated,
                         &snapshot,
                         epoch_seconds,
                         market.start_ts,

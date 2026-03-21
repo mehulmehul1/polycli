@@ -97,7 +97,7 @@ impl KalmanFilter {
     /// σ_η² ∝ spread²
     /// The spread represents microstructure noise - wider spread means
     /// less confidence in the observed price.
-    fn set_measurement_noise(&mut self, spread: f64) {
+    pub fn set_measurement_noise(&mut self, spread: f64) {
         // Convert price spread to logit-space noise
         // For small spread: logit_spread ≈ spread / (4 * p * (1-p))
         // We use a conservative approximation
