@@ -333,10 +333,12 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    println!("[SHADOW MODE] Probability Expansion Scalper");
-    println!("[SHADOW MODE] Entry: slope > 0.002 + breakout | Exit: slope flip");
-    println!("[SHADOW MODE] Range: 0.35 - 0.65 | Size: $1.00");
-    println!("[SHADOW MODE] Feed: {:?}", live_args.feed);
+    println!("[SHADOW MODE] Strategy: {:?}", live_args.strategy);
+    println!("[SHADOW MODE] Entry bands: {:.2} - {:.2}", band_low, band_high);
+    println!("[SHADOW MODE] Size: $1.00 | Feed: {:?}", live_args.feed);
+    if live_args.record {
+        println!("[SHADOW MODE] Recording: {}", live_args.recordings_dir);
+    }
     println!("========================================");
 
     // Create tick recorder if --record flag is set
