@@ -102,6 +102,10 @@ pub struct LiveShadowArgs {
     /// Directory to save recordings (default: recordings/)
     #[arg(long, default_value = "recordings")]
     pub recordings_dir: String,
+
+    /// Strategy mode
+    #[arg(long, value_enum, default_value_t = crate::bot::pipeline::BtStrategy::Scalper)]
+    pub strategy: crate::bot::pipeline::BtStrategy,
 }
 
 
@@ -301,7 +305,13 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
 
     let mut ind_1m = IndicatorEngine::new();
     let mut ind_5s = IndicatorEngine::new();
-    let mut signal_engine = SignalEngine::new();
+
+    let (band_low, band_high) = match live_args.strategy {
+        crate::bot::pipeline::BtStrategy::Scalper => (0.35, 0.65),
+        crate::bot::pipeline::BtStrategy::LateWindow => (0.85, 0.98),
+        crate::bot::pipeline::BtStrategy::FairValue => (0.05, 0.95),
+    };
+    let mut signal_engine = SignalEngine::new_with_band(band_low, band_high);
 
     let mut candle_engine = CandleEngine::new();
     candle_engine.set_debug(false);
