@@ -330,6 +330,17 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
     let mut last_no_bid = 0.0;
     let mut current_slug = watched.slug.clone();
 
+    // FairValue model state (created per market)
+    let mut fv_model = crate::bot::pricing::LogitJumpDiffusion::new();
+    let mut fv_kalman = Some(crate::bot::pricing::KalmanFilter::new(0.0));
+    let mut fv_jump_calibrator = Some(crate::bot::pricing::JumpCalibrator::with_defaults());
+    let mut fv_calibrated = {
+        let base_model = crate::bot::pricing::FairValueModel::default();
+        crate::bot::pricing::CalibratedFairValue::with_defaults(base_model)
+    };
+    let mut fv_cumulative_wins: Vec<f64> = Vec::new();
+    let mut fv_cumulative_losses: Vec<f64> = Vec::new();
+
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -436,6 +447,9 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
                     ind_1m.reset();
                     ind_5s.reset();
                     shadow.full_reset();
+                    fv_model = crate::bot::pricing::LogitJumpDiffusion::new();
+                    fv_kalman = Some(crate::bot::pricing::KalmanFilter::new(0.0));
+                    fv_jump_calibrator = Some(crate::bot::pricing::JumpCalibrator::with_defaults());
                     state_1m = IndicatorState::default();
                     state_5s = IndicatorState::default();
                     last_yes_bid = 0.0;
@@ -500,6 +514,36 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
                             yes_bid, yes_ask, yes_spread, yes_max, no_bid, no_ask, no_spread, no_max, midpoint);
                     }
 
+                    if live_args.strategy == crate::bot::pipeline::BtStrategy::FairValue {
+                        // FairValue: use logit jump-diffusion model
+                        let mut metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd + 1.0);
+                        crate::bot::pipeline::process_fairvalue_snapshot(
+                            &mut fv_model,
+                            &mut fv_kalman,
+                            &mut fv_jump_calibrator,
+                            &mut fv_calibrated,
+                            &dual_snapshot,
+                            epoch_seconds,
+                            watched.end_time.timestamp() - FIVE_MINUTES_SECONDS,
+                            watched.end_time.timestamp(),
+                            &mut shadow,
+                            &mut metrics,
+                            1.0,
+                            0.05, // min_edge
+                            true,  // verbose for live
+                            &mut fv_cumulative_wins,
+                            &mut fv_cumulative_losses,
+                        );
+                        // Update validator with metrics
+                        if metrics.trades_taken > 0 {
+                            if let Some(v) = &mut validator {
+                                v.record_signal();
+                                if metrics.wins > 0 || metrics.losses > 0 {
+                                    v.record_entry_taken();
+                                }
+                            }
+                        }
+                    } else {
                     if let Some(step) = run_shadow_strategy_step(
                         &dual_snapshot,
                         &watched.label,
@@ -548,6 +592,7 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
                             }
                         }
                     }
+                    } // end else (scalper/late-window strategy)
 
                     if shadow.is_active() {
                         let exit_price = match shadow.token_side {
