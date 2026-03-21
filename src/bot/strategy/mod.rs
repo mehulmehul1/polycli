@@ -6,17 +6,11 @@ mod heuristic;
 mod risk;
 mod types;
 
-// Scaffold modules - not compiled (reference undefined types)
-// pub mod temporal_arbitrage;
-// pub mod constraint_engine;
-// pub mod fair_value;
-// pub mod graph_builder;
-// pub mod probability_engine;
+pub mod fair_value;
 
+pub use fair_value::{FairValueEngine, FairValueSignalConfig};
 pub use heuristic::HeuristicEngine;
 pub use risk::RiskGate;
-pub use types::*;
-pub use types::*;
 pub use types::*;
 
 use crate::bot::indicators::IndicatorState;

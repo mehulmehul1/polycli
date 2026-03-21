@@ -2,9 +2,9 @@ use crate::bot::candles::CandleEngine;
 use crate::bot::feed::{DualSnapshot, MarketSnapshot, ReplayMode, ReplaySnapshotSource, StrategyInputSource};
 use crate::bot::indicators::{IndicatorEngine, IndicatorState};
 use crate::bot::logging::{EngineEvent, EngineEventLoggers};
-use crate::bot::risk::{decimal_to_f64, GatekeeperState};
+use crate::bot::risk::{best_ask_price, best_bid_price, decimal_to_f64, midpoint_price, GatekeeperState};
 use crate::bot::shadow::{ShadowPosition, ShadowStepResult, TokenSide};
-use crate::bot::signal::SignalEngine;
+use crate::bot::signal::{EntrySignal, SignalEngine};
 use crate::bot::strategy_runner::run_shadow_strategy_step;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc, Timelike};
@@ -246,6 +246,8 @@ pub enum BtStrategy {
     Scalper,
     /// Late window: high-prob sniping in final minutes
     LateWindow,
+    /// Fair value: Logit jump-diffusion model for edge trading
+    FairValue,
 }
 
 #[derive(Args, Clone)]
@@ -1137,6 +1139,132 @@ pub fn process_pipeline_snapshot(
     None
 }
 
+use crate::bot::pricing::{LogitJumpDiffusion, LogitObservation, prob_to_logit, sigmoid};
+
+/// Process a single snapshot using the fair value logit model.
+/// Returns (entry_signal, exit_signal) where entry_signal is Some((direction, fair_prob, edge)).
+pub fn process_fairvalue_snapshot(
+    logit_model: &mut LogitJumpDiffusion,
+    snapshot: &DualSnapshot,
+    epoch_seconds: u64,
+    market_start_ts: i64,
+    market_end_ts: i64,
+    shadow: &mut ShadowPosition,
+    metrics: &mut PipelineMetrics,
+    position_size_usd: f64,
+    min_edge: f64,
+    verbose: bool,
+    cumulative_wins: &mut Vec<f64>,
+    cumulative_losses: &mut Vec<f64>,
+) {
+    let yes_mid = midpoint_price(&snapshot.yes).unwrap_or(0.5);
+    let no_mid = 1.0 - yes_mid;
+    let time_remaining = (market_end_ts - epoch_seconds as i64).max(0);
+
+    if time_remaining <= 0 {
+        return;
+    }
+
+    let spread = best_ask_price(&snapshot.yes).unwrap_or(0.5) - best_bid_price(&snapshot.yes).unwrap_or(0.5);
+
+    // Create observation
+    let obs = LogitObservation {
+        timestamp: epoch_seconds as i64,
+        prob: yes_mid,
+        logit: prob_to_logit(yes_mid.clamp(0.01, 0.99)),
+        spread,
+        volume: 0.0,
+    };
+
+    // Update model
+    let _filtered = logit_model.update(&obs);
+
+    // Compute fair probability
+    let fair = logit_model.fair_prob(time_remaining);
+    let fair_prob = fair.expected;
+
+    // Edge calculation (includes 2.5% trading cost)
+    let trading_cost = 0.025;
+    let yes_ask = best_ask_price(&snapshot.yes).unwrap_or(1.0);
+    let no_ask = best_ask_price(&snapshot.no).unwrap_or(1.0);
+
+    let edge_yes = fair_prob - yes_ask - trading_cost;
+    let edge_no = (1.0 - fair_prob) - no_ask - trading_cost;
+
+    // Entry logic
+    if !shadow.is_active() {
+        if edge_yes > min_edge && yes_ask < 0.95 && yes_ask > 0.05 {
+            // BUY YES
+            shadow.token_side = Some(TokenSide::Yes);
+            shadow.active_entry = Some(EntrySignal::Long);
+            shadow.entry_price = yes_ask;
+            shadow.size = 1.0;
+            shadow.position_size_usd = position_size_usd;
+            shadow.bankroll_usd -= position_size_usd;
+            shadow.entry_timestamp = epoch_seconds;
+            if verbose {
+                println!("[FV ENTRY] YES @ {:.4} | Fair: {:.4} | Edge: {:.4} | Bankroll: ${:.2}",
+                    yes_ask, fair_prob, edge_yes, shadow.bankroll_usd);
+            }
+        } else if edge_no > min_edge && no_ask < 0.95 && no_ask > 0.05 {
+            // BUY NO
+            shadow.token_side = Some(TokenSide::No);
+            shadow.active_entry = Some(EntrySignal::Short);
+            shadow.entry_price = no_ask;
+            shadow.size = 1.0;
+            shadow.position_size_usd = position_size_usd;
+            shadow.bankroll_usd -= position_size_usd;
+            shadow.entry_timestamp = epoch_seconds;
+            if verbose {
+                println!("[FV ENTRY] NO @ {:.4} | Fair(YES): {:.4} | Edge: {:.4} | Bankroll: ${:.2}",
+                    no_ask, fair_prob, edge_no, shadow.bankroll_usd);
+            }
+        }
+    }
+
+    // Exit logic
+    if shadow.is_active() {
+        let exit_price = match shadow.token_side {
+            Some(TokenSide::Yes) => best_bid_price(&snapshot.yes),
+            Some(TokenSide::No) => best_bid_price(&snapshot.no),
+            _ => None,
+        };
+
+        let should_exit = if let Some(price) = exit_price {
+            // Exit if: edge reversed, or extreme price, or time almost up
+            let current_edge = match shadow.token_side {
+                Some(TokenSide::Yes) => fair_prob - price,
+                Some(TokenSide::No) => (1.0 - fair_prob) - price,
+                _ => 0.0,
+            };
+            current_edge < 0.0 || price > 0.95 || price < 0.05 || time_remaining < 30
+        } else {
+            false
+        };
+
+        if should_exit {
+            if let Some(price) = exit_price {
+                let pnl = shadow.pnl(price);
+                let dollar_pnl = pnl * shadow.position_size_usd;
+                shadow.bankroll_usd += shadow.position_size_usd + dollar_pnl;
+                metrics.trades_taken += 1;
+                if dollar_pnl >= 0.0 {
+                    metrics.wins += 1;
+                    cumulative_wins.push(dollar_pnl);
+                } else {
+                    metrics.losses += 1;
+                    cumulative_losses.push(dollar_pnl);
+                }
+                if verbose {
+                    println!("[FV EXIT] {:.4}% | ${:.4} | Bankroll: ${:.2}",
+                        pnl * 100.0, dollar_pnl, shadow.bankroll_usd);
+                }
+                shadow.reset(epoch_seconds);
+            }
+        }
+    }
+}
+
 pub async fn run_backtest_pipeline(args: BacktestPipelineArgs) -> Result<()> {
     let start: DateTime<Utc> = args.start.parse().context("Invalid start time format")?;
     let end: DateTime<Utc> = args.end.parse().context("Invalid end time format")?;
@@ -1315,6 +1443,7 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
     let (band_low, band_high) = match args.strategy {
         BtStrategy::Scalper => (args.band_low, args.band_high),
         BtStrategy::LateWindow => (0.85, 0.98),
+        BtStrategy::FairValue => (0.05, 0.95), // wide band, model filters instead
     };
 
     // Setup DuckDB
@@ -1373,6 +1502,7 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
             let mut state_5s = IndicatorState::default();
             let mut gatekeeper = GatekeeperState::new(args.size * 3.0, 15);
             shadow.full_reset();
+            let mut fv_model = LogitJumpDiffusion::new();
 
             // Query ticks for this market
             let tick_sql = format!(
@@ -1429,7 +1559,25 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
                     .current_time()
                     .unwrap_or_else(|| snapshot.ts_exchange.floor() as u64);
 
-                if let Some(step) = process_pipeline_snapshot(
+                if args.strategy == BtStrategy::FairValue {
+                    // Fair value strategy uses LogitJumpDiffusion model
+                    process_fairvalue_snapshot(
+                        &mut fv_model,
+                        &snapshot,
+                        epoch_seconds,
+                        market.start_ts,
+                        market.end_ts,
+                        &mut shadow,
+                        &mut metrics,
+                        args.size,
+                        args.min_edge,
+                        args.verbose,
+                        &mut cumulative_wins,
+                        &mut cumulative_losses,
+                    );
+                } else {
+                    // Standard strategy (scalper/late-window)
+                    if let Some(step) = process_pipeline_snapshot(
                     &market,
                     &snapshot,
                     epoch_seconds,
@@ -1454,6 +1602,7 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
                         }
                     }
                 }
+                } // end else (non-fairvalue strategy)
             }
 
             // Settle any open position at end of market
