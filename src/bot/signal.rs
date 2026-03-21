@@ -127,6 +127,11 @@ impl SignalEngine {
             return EntrySignal::None;
         }
 
+        // Entry band filter: only enter when midpoint is within configured band
+        if p < self.entry_band_low || p > self.entry_band_high {
+            return EntrySignal::None;
+        }
+
         // Require minimum window size
         if self.recent_5s_closes.len() < 5 {
             return EntrySignal::None;
@@ -144,7 +149,10 @@ impl SignalEngine {
         if bb_width < 0.15 {
             // Log near misses for BB width if it's close
             if bb_width > 0.05 {
-                println!("[DEBUG] Signal blocked by BB_WIDTH: {:.4} < 0.15 (Slope: {:.4}, RSI: {:.2})", bb_width, slope, rsi);
+                println!(
+                    "[DEBUG] Signal blocked by BB_WIDTH: {:.4} < 0.15 (Slope: {:.4}, RSI: {:.2})",
+                    bb_width, slope, rsi
+                );
             }
             return EntrySignal::None;
         }
@@ -207,7 +215,11 @@ impl Default for SignalEngine {
 mod tests {
     use super::*;
 
-    fn mock_state(slope: Option<f64>, ema_fast: Option<f64>, ema_slow: Option<f64>) -> IndicatorState {
+    fn mock_state(
+        slope: Option<f64>,
+        ema_fast: Option<f64>,
+        ema_slow: Option<f64>,
+    ) -> IndicatorState {
         IndicatorState {
             ema3: ema_fast,
             ema6: ema_slow,
@@ -271,10 +283,10 @@ mod tests {
         let mut engine = SignalEngine::new();
         let five_sec = mock_state(Some(0.005), Some(0.51), Some(0.50));
         let one_min = mock_state(Some(0.001), Some(0.51), Some(0.50));
-        
+
         // Baseline established at 0.50
         engine.update(&five_sec, &one_min, 0.50);
-        
+
         // Probability moves to 0.95 (outside loop safety filter 0.08 - 0.92)
         let state = engine.update(&five_sec, &one_min, 0.95);
         assert_eq!(state.entry, EntrySignal::None);

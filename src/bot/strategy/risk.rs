@@ -54,10 +54,18 @@ impl RiskGate {
     }
 
     /// Check if entry is allowed
-    pub fn check_entry(&self, spread: f64, time_remaining_s: i64, current_ts: i64) -> Result<(), String> {
+    pub fn check_entry(
+        &self,
+        spread: f64,
+        time_remaining_s: i64,
+        current_ts: i64,
+    ) -> Result<(), String> {
         // Check spread
         if spread > self.config.max_spread {
-            return Err(format!("Spread too wide: {:.4} > {:.4}", spread, self.config.max_spread));
+            return Err(format!(
+                "Spread too wide: {:.4} > {:.4}",
+                spread, self.config.max_spread
+            ));
         }
 
         // Check time remaining

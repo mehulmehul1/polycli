@@ -65,9 +65,8 @@ impl FairValueModel {
         let t = (time_remaining_s as f64).max(1.0) / (365.25 * 24.0 * 3600.0);
 
         // Use realized vol if available
-        let sigma_ann = realized_vol
-            .unwrap_or(self.config.base_volatility)
-            * self.config.vol_scale_short;
+        let sigma_ann =
+            realized_vol.unwrap_or(self.config.base_volatility) * self.config.vol_scale_short;
 
         // Per-time volatility
         let sigma_t = sigma_ann * t.sqrt();
@@ -108,9 +107,8 @@ impl FairValueModel {
         }
 
         let t = (time_remaining_s as f64) / (365.25 * 24.0 * 3600.0);
-        let sigma_ann = realized_vol
-            .unwrap_or(self.config.base_volatility)
-            * self.config.vol_scale_short;
+        let sigma_ann =
+            realized_vol.unwrap_or(self.config.base_volatility) * self.config.vol_scale_short;
 
         let sigma_t = sigma_ann * t.sqrt();
 

@@ -2,7 +2,10 @@
 //!
 //! Indicator-based entry/exit logic migrated from signal.rs
 
-use super::{Confidence, Direction, EntryReason, EntrySignal, ExitReason, ExitSignal, Observation, SignalSource, StrategyDecision, StrategyEngine};
+use super::{
+    Confidence, Direction, EntryReason, EntrySignal, ExitReason, ExitSignal, Observation,
+    SignalSource, StrategyDecision, StrategyEngine,
+};
 use crate::bot::indicators::IndicatorState;
 use std::collections::VecDeque;
 
@@ -233,7 +236,11 @@ impl Default for HeuristicEngine {
 mod tests {
     use super::*;
 
-    fn mock_state(slope: Option<f64>, ema_fast: Option<f64>, ema_slow: Option<f64>) -> IndicatorState {
+    fn mock_state(
+        slope: Option<f64>,
+        ema_fast: Option<f64>,
+        ema_slow: Option<f64>,
+    ) -> IndicatorState {
         IndicatorState {
             ema3: ema_fast,
             ema6: ema_slow,

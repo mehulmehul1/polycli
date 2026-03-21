@@ -2,7 +2,7 @@
 //!
 //! Export PMXT archive data to feature parquet.
 
-use super::{CryptoBinaryMarketSpec, FeatureRow, LabelRow, Labeler, LabelConfig, ResearchConfig};
+use super::{CryptoBinaryMarketSpec, FeatureRow, LabelConfig, LabelRow, Labeler, ResearchConfig};
 use anyhow::{anyhow, Result};
 use parquet::file::writer::SerializedFileWriter;
 use std::path::Path;
@@ -27,11 +27,11 @@ impl FeatureExporter {
     /// * `input_path` - Path to PMXT archive parquet
     /// * `output_path` - Output path for features parquet
     /// * `manifest_path` - Output path for manifest JSON
-    pub fn export<P: AsRef<Path>>(
+    pub fn export<P1: AsRef<Path>, P2: AsRef<Path>, P3: AsRef<Path>>(
         &self,
-        input_path: P,
-        output_path: P,
-        manifest_path: P,
+        input_path: P1,
+        output_path: P2,
+        manifest_path: P3,
     ) -> Result<(usize, usize)> {
         // Read PMXT archive
         let rows = self.read_pmxt_archive(input_path.as_ref())?;
@@ -58,89 +58,99 @@ impl FeatureExporter {
 
     fn read_pmxt_archive(&self, path: &Path) -> Result<Vec<FeatureRow>> {
         use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::record::RowAccessor;
 
         let file = std::fs::File::open(path)?;
         let reader = SerializedFileReader::new(file)?;
 
         let mut rows = Vec::new();
-        let iter = reader.into_row_iter(None, None, None)?;
+        for i in 0..reader.num_row_groups() {
+            let row_group = reader.get_row_group(i)?;
+            let iter = row_group.get_row_iter(None)?;
+            for row in iter {
+                let row = row?;
+                let condition_id = row.get_string(0).map(|s| s.to_string()).unwrap_or_default();
+                let ts: i64 = row.get_long(1).unwrap_or(0);
 
-        for row in iter {
-            // Parse PMXT row into FeatureRow
-            // This is a simplified implementation - actual PMXT schema would be more complex
-            let condition_id = row.get_string(0).unwrap_or_default();
-            let ts = row.get_long(1).unwrap_or(0);
+                let yes_bid: f64 = row.get_double(2).unwrap_or(0.5);
+                let yes_ask: f64 = row.get_double(3).unwrap_or(0.5);
+                let no_bid: f64 = row.get_double(4).unwrap_or(0.5);
+                let no_ask: f64 = row.get_double(5).unwrap_or(0.5);
 
-            let yes_bid = row.get_double(2).unwrap_or(0.5);
-            let yes_ask = row.get_double(3).unwrap_or(0.5);
-            let no_bid = row.get_double(4).unwrap_or(0.5);
-            let no_ask = row.get_double(5).unwrap_or(0.5);
+                let yes_mid = (yes_bid + yes_ask) / 2.0;
+                let no_mid = (no_bid + no_ask) / 2.0;
 
-            let yes_mid = (yes_bid + yes_ask) / 2.0;
-            let no_mid = (no_bid + no_ask) / 2.0;
+                // Parse market spec
+                let spec = CryptoBinaryMarketSpec::from_slug(
+                    &format!("{}-market", condition_id),
+                    &condition_id,
+                    ts - 100,
+                    ts + 200,
+                );
 
-            // Parse market spec
-            let spec = CryptoBinaryMarketSpec::from_slug(
-                &format!("{}-market", condition_id),
-                &condition_id,
-                ts - 100,
-                ts + 200,
-            );
+                let (asset, duration, family) = match spec {
+                    Some(s) => (
+                        s.asset.as_str().to_string(),
+                        s.duration.as_str().to_string(),
+                        s.family.as_str().to_string(),
+                    ),
+                    None => (
+                        "unknown".to_string(),
+                        "5m".to_string(),
+                        "updown_open_close".to_string(),
+                    ),
+                };
 
-            let (asset, duration, family) = match spec {
-                Some(s) => (s.asset.as_str().to_string(), s.duration.as_str().to_string(), s.family.as_str().to_string()),
-                None => ("unknown".to_string(), "5m".to_string(), "updown_open_close".to_string()),
-            };
-
-            rows.push(FeatureRow {
-                schema_version: FeatureRow::schema_version().to_string(),
-                condition_id,
-                market_slug: format!("{}-market", condition_id),
-                instrument: condition_id.clone(),
-                asset,
-                duration,
-                market_family: family,
-                market_start_ts: ts - 100,
-                market_end_ts: ts + 200,
-                ts,
-                yes_bid,
-                yes_ask,
-                no_bid,
-                no_ask,
-                yes_mid,
-                no_mid,
-                yes_spread: yes_ask - yes_bid,
-                no_spread: no_ask - no_bid,
-                book_sum: yes_ask + no_ask,
-                book_gap: yes_ask + no_ask - 1.0,
-                yes_bid_depth_1: None,
-                yes_ask_depth_1: None,
-                no_bid_depth_1: None,
-                no_ask_depth_1: None,
-                age_s: 0,
-                time_remaining_s: 200,
-                in_entry_window: true,
-                in_exit_only_window: false,
-                yes_mid_ret_1s: 0.0,
-                yes_mid_ret_5s: 0.0,
-                yes_mid_ret_15s: 0.0,
-                yes_mid_ret_30s: 0.0,
-                no_mid_ret_1s: 0.0,
-                no_mid_ret_5s: 0.0,
-                no_mid_ret_15s: 0.0,
-                no_mid_ret_30s: 0.0,
-                book_gap_z_30s: 0.0,
-                yes_spread_ema_15s: 0.0,
-                no_spread_ema_15s: 0.0,
-                realized_vol_15s: 0.0,
-                realized_vol_30s: 0.0,
-                realized_vol_60s: 0.0,
-                spot_price: None,
-                spot_ret_1s: None,
-                spot_ret_5s: None,
-                spot_ret_15s: None,
-                spot_realized_vol_30s: None,
-            });
+                rows.push(FeatureRow {
+                    schema_version: FeatureRow::schema_version().to_string(),
+                    market_slug: format!("{}-market", condition_id),
+                    instrument: condition_id.clone(),
+                    condition_id,
+                    asset,
+                    duration,
+                    market_family: family,
+                    market_start_ts: ts - 100,
+                    market_end_ts: ts + 200,
+                    ts,
+                    yes_bid,
+                    yes_ask,
+                    no_bid,
+                    no_ask,
+                    yes_mid,
+                    no_mid,
+                    yes_spread: yes_ask - yes_bid,
+                    no_spread: no_ask - no_bid,
+                    book_sum: yes_ask + no_ask,
+                    book_gap: yes_ask + no_ask - 1.0,
+                    yes_bid_depth_1: None,
+                    yes_ask_depth_1: None,
+                    no_bid_depth_1: None,
+                    no_ask_depth_1: None,
+                    age_s: 0,
+                    time_remaining_s: 200,
+                    in_entry_window: true,
+                    in_exit_only_window: false,
+                    yes_mid_ret_1s: 0.0,
+                    yes_mid_ret_5s: 0.0,
+                    yes_mid_ret_15s: 0.0,
+                    yes_mid_ret_30s: 0.0,
+                    no_mid_ret_1s: 0.0,
+                    no_mid_ret_5s: 0.0,
+                    no_mid_ret_15s: 0.0,
+                    no_mid_ret_30s: 0.0,
+                    book_gap_z_30s: 0.0,
+                    yes_spread_ema_15s: 0.0,
+                    no_spread_ema_15s: 0.0,
+                    realized_vol_15s: 0.0,
+                    realized_vol_30s: 0.0,
+                    realized_vol_60s: 0.0,
+                    spot_price: None,
+                    spot_ret_1s: None,
+                    spot_ret_5s: None,
+                    spot_ret_15s: None,
+                    spot_realized_vol_30s: None,
+                });
+            }
         }
 
         Ok(rows)

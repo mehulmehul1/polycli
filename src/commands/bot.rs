@@ -6,6 +6,7 @@ use crate::bot::discovery::{
 use crate::bot::pipeline::{
     self, BacktestArgs, MonteCarloArgs, SweepArgs, FetchPmxtArgs,
     ListMarketsArgs, ExtractMidpointsArgs, InspectParquetArgs, BacktestPipelineArgs,
+    BacktestPmxtArgs, run_backtest_pmxt,
 };
 use crate::bot::feed::{
     LiveFeedMode, LiveStrategyInputSource, StrategyInputSource,
@@ -60,6 +61,8 @@ pub enum BotCommand {
     ListMarkets(ListMarketsArgs),
     /// Stream historical orderbook data from PMXT and run shadow backtest
     BacktestPipeline(BacktestPipelineArgs),
+    /// Backtest across all PMXT parquet files in a directory with rolling bankroll
+    BacktestPmxt(BacktestPmxtArgs),
     /// Export features from PMXT archive to parquet for ML training
     ExportFeatures(ExportFeaturesArgs),
     /// Inspect exported feature parquet file
@@ -239,8 +242,9 @@ pub async fn execute(args: BotArgs) -> Result<()> {
         BotCommand::InspectParquet(inspect_args) => run_inspect_parquet(inspect_args),
         BotCommand::ListMarkets(list_args) => run_list_markets(list_args).await,
         BotCommand::BacktestPipeline(pipeline_args) => run_backtest_pipeline(pipeline_args).await,
+        BotCommand::BacktestPmxt(pmxt_args) => run_backtest_pmxt(pmxt_args).await,
         BotCommand::ExportFeatures(export_args) => run_export_features(export_args).await,
-        BotCommand::InspectFeatures(inspect_args) => run_inspect_features(inspect_args).await,
+        BotCommand::InspectFeatures(inspect_args) => run_inspect_features(inspect_args),
         BotCommand::BacktestScores(backtest_args) => run_backtest_scores(backtest_args).await,
         BotCommand::ScoreShadow(shadow_args) => run_score_shadow(shadow_args).await,
     }
@@ -825,8 +829,9 @@ async fn run_export_features(args: ExportFeaturesArgs) -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(&args.out).with_extension("manifest.json"));
 
+    let manifest_str = manifest_path.to_str().unwrap_or("");
     let (feature_count, label_count) = exporter
-        .export(&args.input, &args.out, &manifest_path)?;
+        .export(&args.input, &args.out, manifest_str)?;
 
     println!("[EXPORT] Wrote {} feature rows", feature_count);
     println!("[EXPORT] Wrote {} label rows", label_count);

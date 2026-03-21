@@ -14,7 +14,11 @@ pub struct VolSurface {
 
 impl VolSurface {
     pub fn new(atm_vol: f64, skew: f64, timestamp: i64) -> Self {
-        Self { atm_vol, skew, timestamp }
+        Self {
+            atm_vol,
+            skew,
+            timestamp,
+        }
     }
 
     /// Get vol at given moneyness
@@ -85,7 +89,8 @@ impl VolatilityCalculator {
         let mean = window.iter().sum::<f64>() / window.len() as f64;
 
         // Calculate variance
-        let variance: f64 = window.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / window.len() as f64;
+        let variance: f64 =
+            window.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / window.len() as f64;
 
         // Annualize (assuming 1-second samples)
         let seconds_per_year = 365.25 * 24.0 * 3600.0;

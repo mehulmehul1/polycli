@@ -29,39 +29,44 @@ impl ScoreLoader {
 
     /// Load scores from a parquet file
     pub fn load(&mut self, path: &Path) -> Result<usize> {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::record::RowAccessor;
+
         let file = std::fs::File::open(path)?;
         let reader = SerializedFileReader::new(file)?;
-        let iter = reader.into_row_iter(None, None, None)?;
 
         let mut count = 0;
-        for row in iter {
-            // Parse row into ScoreRow
-            // This is simplified - actual implementation would use parquet schema
-            let condition_id = row.get_string(1)?.to_string();
-            let ts = row.get_long(2)?;
+        for i in 0..reader.num_row_groups() {
+            let row_group = reader.get_row_group(i)?;
+            let iter = row_group.get_row_iter(None)?;
+            for row in iter {
+                let row = row?;
+                let condition_id = row.get_string(1).map(|s| s.to_string())?;
+                let ts: i64 = row.get_long(2)?;
 
-            let score = ScoreRow {
-                schema_version: ScoreRow::schema_version().to_string(),
-                condition_id: condition_id.clone(),
-                ts,
-                model_version: "v1".to_string(),
-                score_yes_15s: row.get_double(4)?,
-                score_yes_30s: row.get_double(5)?,
-                score_yes_45s: row.get_double(6)?,
-                score_no_15s: row.get_double(7)?,
-                score_no_30s: row.get_double(8)?,
-                score_no_45s: row.get_double(9)?,
-                risk_yes_30s: row.get_double(10)?,
-                risk_no_30s: row.get_double(11)?,
-                fresh_until_ts: row.get_long(12)?,
-            };
+                let score = ScoreRow {
+                    schema_version: ScoreRow::schema_version().to_string(),
+                    condition_id: condition_id.clone(),
+                    ts,
+                    model_version: "v1".to_string(),
+                    score_yes_15s: row.get_double(4)?,
+                    score_yes_30s: row.get_double(5)?,
+                    score_yes_45s: row.get_double(6)?,
+                    score_no_15s: row.get_double(7)?,
+                    score_no_30s: row.get_double(8)?,
+                    score_no_45s: row.get_double(9)?,
+                    risk_yes_30s: row.get_double(10)?,
+                    risk_no_30s: row.get_double(11)?,
+                    fresh_until_ts: row.get_long(12)?,
+                };
 
-            self.cache
-                .entry(condition_id)
-                .or_insert_with(HashMap::new)
-                .insert(ts, score);
+                self.cache
+                    .entry(condition_id)
+                    .or_insert_with(HashMap::new)
+                    .insert(ts, score);
 
-            count += 1;
+                count += 1;
+            }
         }
 
         Ok(count)

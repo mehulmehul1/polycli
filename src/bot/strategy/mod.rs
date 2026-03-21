@@ -2,13 +2,22 @@
 //!
 //! Unified strategy engine for Polymarket trading decisions.
 
-mod types;
 mod heuristic;
 mod risk;
+mod types;
 
-pub use types::*;
+// Scaffold modules - not compiled (reference undefined types)
+// pub mod temporal_arbitrage;
+// pub mod constraint_engine;
+// pub mod fair_value;
+// pub mod graph_builder;
+// pub mod probability_engine;
+
 pub use heuristic::HeuristicEngine;
 pub use risk::RiskGate;
+pub use types::*;
+pub use types::*;
+pub use types::*;
 
 use crate::bot::indicators::IndicatorState;
 
@@ -92,30 +101,26 @@ impl StrategyEngine for FusedEngine {
             FusionMode::QlibOnly => {
                 // Qlib-only mode: use scores if available
                 match obs.qlib_score {
-                    Some(score) if score > self.confidence_threshold => {
-                        StrategyDecision::Enter {
-                            direction: Direction::Yes,
-                            reason: EntryReason {
-                                source: SignalSource::QlibScore,
-                                confidence: Confidence::new(score),
-                                detail: format!("Qlib score: {:.3}", score),
-                                fair_value_edge: None,
-                                qlib_score: Some(score),
-                            },
-                        }
-                    }
-                    Some(score) if score < -self.confidence_threshold => {
-                        StrategyDecision::Enter {
-                            direction: Direction::No,
-                            reason: EntryReason {
-                                source: SignalSource::QlibScore,
-                                confidence: Confidence::new(-score),
-                                detail: format!("Qlib score: {:.3}", score),
-                                fair_value_edge: None,
-                                qlib_score: Some(score),
-                            },
-                        }
-                    }
+                    Some(score) if score > self.confidence_threshold => StrategyDecision::Enter {
+                        direction: Direction::Yes,
+                        reason: EntryReason {
+                            source: SignalSource::QlibScore,
+                            confidence: Confidence::new(score),
+                            detail: format!("Qlib score: {:.3}", score),
+                            fair_value_edge: None,
+                            qlib_score: Some(score),
+                        },
+                    },
+                    Some(score) if score < -self.confidence_threshold => StrategyDecision::Enter {
+                        direction: Direction::No,
+                        reason: EntryReason {
+                            source: SignalSource::QlibScore,
+                            confidence: Confidence::new(-score),
+                            detail: format!("Qlib score: {:.3}", score),
+                            fair_value_edge: None,
+                            qlib_score: Some(score),
+                        },
+                    },
                     _ => StrategyDecision::Hold,
                 }
             }
@@ -135,10 +140,7 @@ impl StrategyEngine for FusedEngine {
                                 confidence: Confidence::new(
                                     (reason.confidence.value() + score.abs()) / 2.0,
                                 ),
-                                detail: format!(
-                                    "Fused: heuristic + qlib ({:.3})",
-                                    score
-                                ),
+                                detail: format!("Fused: heuristic + qlib ({:.3})", score),
                                 fair_value_edge: reason.fair_value_edge,
                                 qlib_score: Some(score),
                             },

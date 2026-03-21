@@ -3,7 +3,7 @@ use crate::bot::feed::{DualSnapshot, MarketSnapshot, ReplayMode, ReplaySnapshotS
 use crate::bot::indicators::{IndicatorEngine, IndicatorState};
 use crate::bot::logging::{EngineEvent, EngineEventLoggers};
 use crate::bot::risk::{decimal_to_f64, GatekeeperState};
-use crate::bot::shadow::{ShadowPosition, TokenSide};
+use crate::bot::shadow::{ShadowPosition, ShadowStepResult, TokenSide};
 use crate::bot::signal::SignalEngine;
 use crate::bot::strategy_runner::run_shadow_strategy_step;
 use anyhow::{Context, Result};
@@ -239,6 +239,66 @@ pub struct ListMarketsArgs {
     pub verbose: bool,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BtStrategy {
+    /// Scalper: EMA crossover + RSI + Bollinger Bands
+    Scalper,
+    /// Late window: high-prob sniping in final minutes
+    LateWindow,
+}
+
+#[derive(Args, Clone)]
+pub struct BacktestPmxtArgs {
+    /// Directory containing PMXT parquet files
+    #[arg(long)]
+    pub input_dir: String,
+
+    /// Strategy mode
+    #[arg(long, value_enum, default_value_t = BtStrategy::Scalper)]
+    pub strategy: BtStrategy,
+
+    /// Starting capital in USD
+    #[arg(long, default_value = "5")]
+    pub capital: f64,
+
+    /// Position size in USD per trade
+    #[arg(long, default_value = "1")]
+    pub size: f64,
+
+    /// Entry band low (only for scalper)
+    #[arg(long, default_value = "0.35")]
+    pub band_low: f64,
+
+    /// Entry band high (only for scalper)
+    #[arg(long, default_value = "0.65")]
+    pub band_high: f64,
+
+    /// Minimum edge for late-window strategy
+    #[arg(long, default_value = "0.05")]
+    pub min_edge: f64,
+
+    /// Filter pattern for market slug
+    #[arg(long, default_value = "btc-updown-5m")]
+    pub filter: String,
+
+    /// Crypto asset filter
+    #[arg(long, value_enum, default_value_t = CryptoAsset::Btc)]
+    pub crypto: CryptoAsset,
+
+    /// Minimum ticks per market
+    #[arg(long, default_value = "1")]
+    pub min_ticks: usize,
+
+    /// Export results to JSON
+    #[arg(long)]
+    pub export: Option<String>,
+
+    /// Show verbose output
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
 // ── Enums and Constants ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, PartialEq, Eq)]
@@ -426,6 +486,7 @@ fn build_replay_snapshots(rows: &[ReplayRow], replay_mode: ReplayMode) -> Vec<Du
 
     match replay_mode {
         ReplayMode::EventByEvent => {
+            let (mut prev_yes_bid, mut prev_yes_ask, mut prev_no_bid, mut prev_no_ask) = (0.0, 0.0, 0.0, 0.0);
             for row in rows {
                 match row.side.as_str() {
                     "YES" => {
@@ -439,7 +500,18 @@ fn build_replay_snapshots(rows: &[ReplayRow], replay_mode: ReplayMode) -> Vec<Du
                     _ => continue,
                 }
                 if yes_bid > 0.0 && yes_ask > 0.0 && no_bid > 0.0 && no_ask > 0.0 {
-                    snapshots.push(build_dual_snapshot(yes_bid, yes_ask, no_bid, no_ask, row.ts));
+                    // Dedup: only emit snapshot when prices actually change
+                    if (yes_bid - prev_yes_bid).abs() > 0.0001
+                        || (yes_ask - prev_yes_ask).abs() > 0.0001
+                        || (no_bid - prev_no_bid).abs() > 0.0001
+                        || (no_ask - prev_no_ask).abs() > 0.0001
+                    {
+                        snapshots.push(build_dual_snapshot(yes_bid, yes_ask, no_bid, no_ask, row.ts));
+                        prev_yes_bid = yes_bid;
+                        prev_yes_ask = yes_ask;
+                        prev_no_bid = no_bid;
+                        prev_no_ask = no_ask;
+                    }
                 }
             }
         }
@@ -1015,7 +1087,7 @@ pub fn process_pipeline_snapshot(
     position_size_usd: f64,
     verbose: bool,
     event_loggers: Option<&EngineEventLoggers>,
-) {
+) -> Option<ShadowStepResult> {
     metrics.total_ticks += 1;
 
     if let Some(loggers) = event_loggers {
@@ -1051,7 +1123,7 @@ pub fn process_pipeline_snapshot(
         if step.entry_blocked && verbose {
             println!("[PIPELINE] blocked entry {}", market.condition_id);
         }
-        if let Some(exit_trade) = step.exit_trade {
+        if let Some(exit_trade) = &step.exit_trade {
             metrics.trades_taken += 1;
             if exit_trade.pnl_usd >= 0.0 {
                 metrics.wins += 1;
@@ -1060,7 +1132,9 @@ pub fn process_pipeline_snapshot(
             }
             update_pipeline_capital_metrics(metrics, shadow.bankroll_usd);
         }
+        return Some(step);
     }
+    None
 }
 
 pub async fn run_backtest_pipeline(args: BacktestPipelineArgs) -> Result<()> {
@@ -1175,7 +1249,8 @@ pub async fn run_backtest_pipeline(args: BacktestPipelineArgs) -> Result<()> {
                 } else {
                     last_no_bid
                 };
-                let pnl = shadow.pnl(if side_bid > 0.5 { 1.0 } else { 0.0 }) * shadow.position_size_usd;
+                let settlement = if side_bid > 0.5 { 1.0 } else { 0.0 };
+                let pnl = shadow.pnl(settlement) * shadow.position_size_usd;
                 shadow.bankroll_usd += shadow.position_size_usd + pnl;
                 metrics.trades_taken += 1;
                 if pnl >= 0.0 { metrics.wins += 1; } else { metrics.losses += 1; }
@@ -1202,6 +1277,304 @@ pub async fn run_backtest_pipeline(args: BacktestPipelineArgs) -> Result<()> {
         writer.flush()?;
     }
     metrics.print_summary();
+    Ok(())
+}
+
+pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
+    use std::path::Path;
+    use std::collections::HashSet;
+
+    // Collect all parquet files from directory
+    let dir = Path::new(&args.input_dir);
+    if !dir.is_dir() {
+        anyhow::bail!("Not a directory: {}", args.input_dir);
+    }
+
+    let mut parquet_files: Vec<(String, i64)> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
+            if let Some(ts) = extract_hour_from_filename(&path.to_string_lossy()) {
+                parquet_files.push((path.to_string_lossy().to_string(), ts));
+            }
+        }
+    }
+
+    if parquet_files.is_empty() {
+        anyhow::bail!("No parquet files found in {}", args.input_dir);
+    }
+
+    // Sort by timestamp
+    parquet_files.sort_by_key(|(_, ts)| *ts);
+    println!("[BACKTEST-PMXT] Found {} parquet files (sorted chronologically)", parquet_files.len());
+    println!("[BACKTEST-PMXT] Strategy: {:?}", args.strategy);
+    println!("[BACKTEST-PMXT] Starting capital: ${:.2}", args.capital);
+
+    // Strategy config
+    let (band_low, band_high) = match args.strategy {
+        BtStrategy::Scalper => (args.band_low, args.band_high),
+        BtStrategy::LateWindow => (0.85, 0.98),
+    };
+
+    // Setup DuckDB
+    let conn = duckdb::Connection::open_in_memory()?;
+    conn.execute_batch("INSTALL httpfs; LOAD httpfs; PRAGMA threads=4;")?;
+
+    // Global state (persists across files)
+    let mut metrics = PipelineMetrics::new(args.capital);
+    let mut shadow = ShadowPosition::default();
+    shadow.bankroll_usd = args.capital;
+    let mut processed_markets: HashSet<String> = HashSet::new();
+    let mut file_num = 0;
+    let mut cumulative_wins: Vec<f64> = Vec::new();
+    let mut cumulative_losses: Vec<f64> = Vec::new();
+    let mut bankroll_history: Vec<(String, f64)> = Vec::new(); // (slug, bankroll after market)
+
+    for (file_path, file_ts) in &parquet_files {
+        file_num += 1;
+        let hour_label = chrono::DateTime::from_timestamp(*file_ts, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| format!("ts={}", file_ts));
+
+        println!("\n[FILE {}/{}] {} — {}", file_num, parquet_files.len(), hour_label, file_path);
+
+        // Discover markets in this file (uses Gamma API to verify BTC 5m)
+        let discovered = match discover_markets_for_input(&conn, file_path, args.min_ticks, args.crypto, Some(&args.filter), args.verbose).await {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("  [WARN] Discovery failed for {}: {}", file_path, e);
+                continue;
+            }
+        };
+
+        if discovered.is_empty() {
+            println!("  No markets found in this file");
+            continue;
+        }
+
+        // Sort markets by start time
+        let mut sorted_markets = discovered;
+        sorted_markets.sort_by_key(|m| m.start_ts);
+
+        for market in sorted_markets {
+            if !processed_markets.insert(market.condition_id.clone()) {
+                continue;
+            }
+
+            metrics.total_markets += 1;
+
+            // Fresh indicator/signal state per market
+            let mut candle_engine = CandleEngine::new();
+            let mut ind_1m = IndicatorEngine::new();
+            let mut ind_5s = IndicatorEngine::new();
+            let mut signal_engine = SignalEngine::new_with_band(band_low, band_high);
+            let mut state_1m = IndicatorState::default();
+            let mut state_5s = IndicatorState::default();
+            let mut gatekeeper = GatekeeperState::new(args.size * 3.0, 15);
+            shadow.full_reset();
+
+            // Query ticks for this market
+            let tick_sql = format!(
+                "SELECT COALESCE(TRY_CAST(data->>'$.timestamp' AS DOUBLE), 0.0) as ts, \
+                        COALESCE(UPPER(data->>'$.side'), '') as side, \
+                        COALESCE(TRY_CAST(data->>'$.best_bid' AS DOUBLE), 0.0) as bid, \
+                        COALESCE(TRY_CAST(data->>'$.best_ask' AS DOUBLE), 0.0) as ask \
+                 FROM read_parquet('{}') WHERE market_id = '{}' ORDER BY ts",
+                file_path, market.condition_id
+            );
+
+            let mut stmt = match conn.prepare(&tick_sql) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("  [WARN] SQL failed for {}: {}", market.slug, e);
+                    continue;
+                }
+            };
+
+            let rows = match stmt.query_map([], |row| {
+                Ok(ReplayRow {
+                    ts: row.get::<_, f64>(0)?,
+                    side: row.get::<_, String>(1)?,
+                    bid: row.get::<_, f64>(2)?,
+                    ask: row.get::<_, f64>(3)?,
+                })
+            }) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("  [WARN] Query failed for {}: {}", market.slug, e);
+                    continue;
+                }
+            };
+
+            let mut replay_rows = Vec::new();
+            for row in rows {
+                replay_rows.push(row?);
+            }
+
+            if replay_rows.is_empty() {
+                continue;
+            }
+
+            let snapshots = build_replay_snapshots(&replay_rows, ReplayMode::EventByEvent);
+            let mut replay_source = ReplaySnapshotSource::new(snapshots);
+
+            let mut last_yes_bid = 0.0;
+            let mut last_no_bid = 0.0;
+
+            while let Some(snapshot) = replay_source.next_snapshot().await? {
+                last_yes_bid = snapshot.yes.best_bid.map(decimal_to_f64).unwrap_or(last_yes_bid);
+                last_no_bid = snapshot.no.best_bid.map(decimal_to_f64).unwrap_or(last_no_bid);
+                let epoch_seconds = replay_source
+                    .current_time()
+                    .unwrap_or_else(|| snapshot.ts_exchange.floor() as u64);
+
+                if let Some(step) = process_pipeline_snapshot(
+                    &market,
+                    &snapshot,
+                    epoch_seconds,
+                    &mut candle_engine,
+                    &mut ind_1m,
+                    &mut ind_5s,
+                    &mut signal_engine,
+                    &mut state_1m,
+                    &mut state_5s,
+                    &mut shadow,
+                    &mut gatekeeper,
+                    &mut metrics,
+                    args.size,
+                    args.verbose,
+                    None,
+                ) {
+                    if let Some(exit_trade) = step.exit_trade {
+                        if exit_trade.pnl_usd >= 0.0 {
+                            cumulative_wins.push(exit_trade.pnl_usd);
+                        } else {
+                            cumulative_losses.push(exit_trade.pnl_usd);
+                        }
+                    }
+                }
+            }
+
+            // Settle any open position at end of market
+            if shadow.is_active() {
+                let side_bid = if shadow.token_side == Some(TokenSide::Yes) {
+                    last_yes_bid
+                } else {
+                    last_no_bid
+                };
+                // Binary resolution: if the held side's last bid > 0.5, it won (1.0), else lost (0.0)
+                let settlement = if side_bid > 0.5 { 1.0 } else { 0.0 };
+                let pnl = shadow.pnl(settlement) * shadow.position_size_usd;
+                shadow.bankroll_usd += shadow.position_size_usd + pnl;
+                metrics.trades_taken += 1;
+                if pnl >= 0.0 {
+                    metrics.wins += 1;
+                    cumulative_wins.push(pnl);
+                } else {
+                    metrics.losses += 1;
+                    cumulative_losses.push(pnl);
+                }
+                shadow.reset(market.end_ts as u64);
+            }
+
+            // Track bankroll
+            bankroll_history.push((market.slug.clone(), shadow.bankroll_usd));
+
+            // Update peak/drawdown
+            if shadow.bankroll_usd > metrics.peak_capital {
+                metrics.peak_capital = shadow.bankroll_usd;
+            }
+            let drawdown = (metrics.peak_capital - shadow.bankroll_usd) / metrics.peak_capital;
+            if drawdown > metrics.max_drawdown {
+                metrics.max_drawdown = drawdown;
+            }
+
+            if args.verbose {
+                println!("  {} | Bankroll: ${:.2} | Ticks: {}", market.slug, shadow.bankroll_usd, market.ticks);
+            }
+        }
+    }
+
+    // Final metrics
+    metrics.ending_capital = shadow.bankroll_usd;
+    metrics.total_pnl = metrics.ending_capital - metrics.starting_capital;
+    metrics.total_pnl_pct = (metrics.total_pnl / metrics.starting_capital) * 100.0;
+
+    // Print enhanced summary
+    println!("\n================ BACKTEST-PMXT SUMMARY ================");
+    println!("Files Processed:    {}", parquet_files.len());
+    println!("Markets Processed:  {}", metrics.total_markets);
+    println!("Total Ticks:        {}", metrics.total_ticks);
+    println!("Trades Taken:       {}", metrics.trades_taken);
+    let win_rate = if metrics.trades_taken > 0 {
+        metrics.wins as f64 / metrics.trades_taken as f64 * 100.0
+    } else { 0.0 };
+    println!("Wins/Losses:        {} / {} ({:.1}%)", metrics.wins, metrics.losses, win_rate);
+
+    let avg_win = if !cumulative_wins.is_empty() {
+        cumulative_wins.iter().sum::<f64>() / cumulative_wins.len() as f64
+    } else { 0.0 };
+    let avg_loss = if !cumulative_losses.is_empty() {
+        cumulative_losses.iter().sum::<f64>() / cumulative_losses.len() as f64
+    } else { 0.0 };
+    let profit_factor = if avg_loss.abs() > 0.0001 {
+        avg_win / avg_loss.abs()
+    } else if avg_win > 0.0 { f64::INFINITY } else { 0.0 };
+
+    println!("Avg Win:            ${:.4}", avg_win);
+    println!("Avg Loss:           ${:.4}", avg_loss);
+    println!("Profit Factor:      {:.2}", profit_factor);
+    println!("------------------------------------------------------");
+    println!("Starting Capital:   ${:.2}", metrics.starting_capital);
+    println!("Ending Capital:     ${:.2}", metrics.ending_capital);
+    println!("Total PnL:          ${:.2} ({:.2}%)", metrics.total_pnl, metrics.total_pnl_pct);
+    println!("Max Drawdown:       {:.2}%", metrics.max_drawdown * 100.0);
+    println!("======================================================");
+
+    if let Some(path) = &args.export {
+        #[derive(Serialize)]
+        struct ExportResult {
+            files_processed: usize,
+            markets_processed: usize,
+            total_ticks: usize,
+            trades_taken: usize,
+            wins: usize,
+            losses: usize,
+            win_rate: f64,
+            avg_win: f64,
+            avg_loss: f64,
+            profit_factor: f64,
+            starting_capital: f64,
+            ending_capital: f64,
+            total_pnl: f64,
+            total_pnl_pct: f64,
+            max_drawdown: f64,
+            bankroll_history: Vec<(String, f64)>,
+        }
+        let result = ExportResult {
+            files_processed: parquet_files.len(),
+            markets_processed: metrics.total_markets,
+            total_ticks: metrics.total_ticks,
+            trades_taken: metrics.trades_taken,
+            wins: metrics.wins,
+            losses: metrics.losses,
+            win_rate,
+            avg_win,
+            avg_loss,
+            profit_factor,
+            starting_capital: metrics.starting_capital,
+            ending_capital: metrics.ending_capital,
+            total_pnl: metrics.total_pnl,
+            total_pnl_pct: metrics.total_pnl_pct,
+            max_drawdown: metrics.max_drawdown,
+            bankroll_history,
+        };
+        let file = std::fs::File::create(path)?;
+        serde_json::to_writer_pretty(file, &result)?;
+        println!("[EXPORT] Results written to {}", path);
+    }
+
     Ok(())
 }
 

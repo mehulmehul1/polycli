@@ -135,3 +135,12 @@ pub enum ExitSignal {
     FullExit,
     None,
 }
+
+/// Strategy mode for market classifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StrategyMode {
+    Scalper,
+    FairValue,
+    LateWindow,
+    TemporalArb,
+}

@@ -5,5 +5,5 @@
 mod fair_value;
 mod volatility;
 
-pub use fair_value::{FairValueModel, FairValueConfig};
-pub use volatility::{VolatilityCalculator, VolSurface};
+pub use fair_value::{FairValueConfig, FairValueModel};
+pub use volatility::{VolSurface, VolatilityCalculator};
