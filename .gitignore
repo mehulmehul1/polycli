@@ -19,3 +19,20 @@ rs-clob-client/
 .env
 
 CLAUDE.md
+
+# Data directories (large, not committed)
+recordings/
+pmxtarchives/
+validation/
+*.parquet
+
+# Temp files
+tmp/
+tmp_test/
+*.log
+*.json
+!Cargo.lock
+!src/**/*.json
+
+# Build artifacts
+nul
