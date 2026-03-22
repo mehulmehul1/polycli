@@ -33,6 +33,14 @@ pub fn run_shadow_strategy_step(
 
     let time_remaining = market_end_ts - (epoch_seconds as i64);
 
+    // Debug: show first few ticks
+    if epoch_seconds % 10 == 0 {
+        println!(
+            "[STEP] ts={} mid={:.4} spread={:.4}",
+            epoch_seconds, midpoint, spread_f64
+        );
+    }
+
     if spread_f64 > 0.08 {
         if epoch_seconds % 30 == 0 {
             println!("[DEBUG] Blocked by SPREAD: {:.4} > 0.08", spread_f64);
@@ -46,7 +54,10 @@ pub fn run_shadow_strategy_step(
 
     if midpoint > 0.92 || midpoint < 0.08 {
         if epoch_seconds % 30 == 0 {
-            println!("[DEBUG] Blocked by RANGE: {:.4} (Market trending to end)", midpoint);
+            println!(
+                "[DEBUG] Blocked by RANGE: {:.4} (Market trending to end)",
+                midpoint
+            );
         }
         return None;
     }
@@ -76,14 +87,20 @@ pub fn run_shadow_strategy_step(
         };
 
         if book_sum > 1.03 || book_sum < 0.97 {
-            println!("[SIGNAL] BOOK_INEFFICIENCY: sum={:.4} signal={:?}", book_sum, book_signal);
+            println!(
+                "[SIGNAL] BOOK_INEFFICIENCY: sum={:.4} signal={:?}",
+                book_sum, book_signal
+            );
         }
 
         let indicator_signal = signal.entry;
         if indicator_signal != EntrySignal::None {
             let bbw = state_5s.bb_width.unwrap_or(0.0);
             let bbp = state_5s.bb_percent.unwrap_or(0.0);
-            println!("[SIGNAL] INDICATOR_MATCH: {:?} (BBW={:.4} BBP={:.4})", indicator_signal, bbw, bbp);
+            println!(
+                "[SIGNAL] INDICATOR_MATCH: {:?} (BBW={:.4} BBP={:.4})",
+                indicator_signal, bbw, bbp
+            );
         }
 
         // Final Logic
@@ -92,7 +109,10 @@ pub fn run_shadow_strategy_step(
             println!("[SIGNAL] FINAL: Using Indicators ({:?})", indicator_signal);
             indicator_signal
         } else if book_signal != EntrySignal::None {
-            println!("[SIGNAL] FINAL: Using Book Inefficiency ({:?})", book_signal);
+            println!(
+                "[SIGNAL] FINAL: Using Book Inefficiency ({:?})",
+                book_signal
+            );
             book_signal
         } else {
             EntrySignal::None

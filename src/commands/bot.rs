@@ -348,9 +348,6 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
     println!("[SHADOW MODE] Strategy: {:?}", live_args.strategy);
     println!("[SHADOW MODE] Entry bands: {:.2} - {:.2}", band_low, band_high);
     println!("[SHADOW MODE] Size: $1.00 | Feed: {:?}", live_args.feed);
-    if live_args.record {
-        println!("[SHADOW MODE] Recording: {}", live_args.recordings_dir);
-    }
     println!("========================================");
 
     // Create tick recorder if --record flag is set
@@ -473,9 +470,9 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
                 if let Some(midpoint) = midpoint_price(&dual_snapshot.yes) {
                     last_yes_bid = best_bid_price(&dual_snapshot.yes).unwrap_or(last_yes_bid);
                     last_no_bid = best_bid_price(&dual_snapshot.no).unwrap_or(last_no_bid);
-                    let epoch_seconds = input_source
+                    let epoch_seconds = (input_source
                         .current_time()
-                        .unwrap_or_else(|| dual_snapshot.ts_exchange.floor() as u64);
+                        .unwrap_or_else(|| dual_snapshot.ts_exchange.floor() as u64)) / 1000;
 
                     // Record tick if recording is enabled
                     if let Some(ref mut rec) = recorder {
