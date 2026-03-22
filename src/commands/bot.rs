@@ -338,6 +338,7 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
         let base_model = crate::bot::pricing::FairValueModel::default();
         crate::bot::pricing::CalibratedFairValue::with_defaults(base_model)
     };
+    let mut fv_metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd);
     let mut fv_cumulative_wins: Vec<f64> = Vec::new();
     let mut fv_cumulative_losses: Vec<f64> = Vec::new();
 
@@ -450,6 +451,7 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
                     fv_model = crate::bot::pricing::LogitJumpDiffusion::new();
                     fv_kalman = Some(crate::bot::pricing::KalmanFilter::new(0.0));
                     fv_jump_calibrator = Some(crate::bot::pricing::JumpCalibrator::with_defaults());
+                    fv_metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd);
                     state_1m = IndicatorState::default();
                     state_5s = IndicatorState::default();
                     last_yes_bid = 0.0;
@@ -516,7 +518,7 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
 
                     if live_args.strategy == crate::bot::pipeline::BtStrategy::FairValue {
                         // FairValue: use logit jump-diffusion model
-                        let mut metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd + 1.0);
+                        let prev_trades = fv_metrics.trades_taken;
                         crate::bot::pipeline::process_fairvalue_snapshot(
                             &mut fv_model,
                             &mut fv_kalman,
@@ -527,20 +529,18 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
                             watched.end_time.timestamp() - FIVE_MINUTES_SECONDS,
                             watched.end_time.timestamp(),
                             &mut shadow,
-                            &mut metrics,
+                            &mut fv_metrics,
                             1.0,
-                            0.05, // min_edge
-                            true,  // verbose for live
+                            0.05,
+                            true,
                             &mut fv_cumulative_wins,
                             &mut fv_cumulative_losses,
                         );
-                        // Update validator with metrics
-                        if metrics.trades_taken > 0 {
+                        // Update validator if trade happened
+                        if fv_metrics.trades_taken > prev_trades {
                             if let Some(v) = &mut validator {
                                 v.record_signal();
-                                if metrics.wins > 0 || metrics.losses > 0 {
-                                    v.record_entry_taken();
-                                }
+                                v.record_entry_taken();
                             }
                         }
                     } else {
