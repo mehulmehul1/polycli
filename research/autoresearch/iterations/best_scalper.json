@@ -1,0 +1,22 @@
+{
+  "parameters": {
+    "band_low": 0.35,
+    "band_high": 0.65,
+    "rsi_long_threshold": 70.0,
+    "rsi_short_threshold": 30.0,
+    "slope_threshold": 0.002,
+    "bb_width_min": 0.15,
+    "bb_width_reversal": 0.9,
+    "book_sum_high": 1.03,
+    "book_sum_low": 0.97,
+    "spread_max": 0.08,
+    "time_remaining_min": 45
+  },
+  "metrics": {
+    "profit_factor": 2.760392535089929,
+    "win_rate": 41.17647058823529,
+    "total_pnl_pct": 38.011298193313685,
+    "fitness": 1.1641068092353476
+  },
+  "notes": "Baseline scalper strategy. Further iterations blocked due to infinite loop in scalper backtest after code modifications. Baseline fitness is the best observed among limited band variations."
+}

@@ -1,0 +1,20 @@
+iteration	commit	metric	fitness	delta	status	description
+0	2f6d822	0.000	0.497	0.000	baseline	133 trades, 42.1% WR, PF 1.31, PnL -11.41%, bb_width=0, ms timestamps, event-by-event WS
+1	-	-37.20	0.364	-0.133	discard	min_heai 0.03→0.08: 55 trades, 40.0% WR, PF 1.02. Too few trades, PF dropped.
+2	a7849fb	9.93	0.535	+0.038	keep	HEAI reversal exit 0.05→0.10: 105 trades, 48.6% WR, PF 1.11, PnL +9.93%. Less whipsawing.
+3	5a0383f	11.10	0.612	+0.077	keep	stop loss -8%→-6%: 122 trades, 43.4% WR, PF 1.36, PnL +11.10%, drawdown 33% (was 47%)
+4	-	-1.54	0.541	-0.071	discard	TP +12%→+10%: 153 trades, 44.4% WR, PF 1.24. Cut winners short, lost money.
+5	a03346d	31.12	0.672	+0.060	keep	min_heai 0.03→0.05: 100 trades, 46.0% WR, PF 1.37, PnL +31.12%, drawdown 22.5%. Best so far.
+6	-	-13.59	0.520	-0.152	discard	kernel_decay 0.5→0.3: 120 trades, 42.5% WR, PF 1.28. Noisier signals, lost money.
+7	-	16.76	0.629	-0.043	discard	cooldown 3→2: 106 trades, 44.3% WR, PF 1.36. Worse than best (0.672).
+8	bdca69d	7.97	0.764	+0.092	keep	PM baseline: configurable TP/SL. TP=30%, SL=-10%. 50 trades, 36% WR, PF 1.87. Huge avg wins ($0.46).
+11	-	0.22	0.704	-0.060	discard	TP 30%→50%: 44 trades, 36.4% WR, PF 1.75. Too few hits TP.
+12	-	-103.17	0.472	-0.292	discard	SL -10%→-15%: Account blown. Stop too wide.
+13	-	2.14	0.741	-0.023	discard	TP 30%→40%: 48 trades, 35.4% WR, PF 1.85. Marginally worse.
+14	-	-26.37	0.777	+0.013	discard	SL -10%→-8%: PF 2.21 highest, but lost money. WR 27.9% too low.
+15	56debb6	27.85	0.817	+0.053	keep	min_heai 0.05→0.04: 57 trades, 38.6% WR, PF 1.86, PnL +27.85%, drawdown 14.8%
+16	-	-9.18	0.668	-0.149	discard	kernel_decay 0.5→0.4: lost money, noisier.
+17	-	26.19	0.750	-0.067	discard	HEAI exit ±0.10→±0.08: worse WR and PnL.
+18	-	27.85	0.817	0.000	discard	min_time_remaining 45→30: no effect.
+19	-	-15.81	0.693	-0.124	discard	min_heai 0.04→0.06: too few trades, lost money.
+20	13632d1	24.86	0.828	+0.011	keep	min_entry_prob 0.15→0.18: PF 1.92 highest, PnL +24.86%, drawdown 17.2%.

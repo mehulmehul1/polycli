@@ -33,6 +33,7 @@ tmp_test/
 *.json
 !Cargo.lock
 !src/**/*.json
+!research/autoresearch/**/*.json
 
 # Build artifacts
 nul

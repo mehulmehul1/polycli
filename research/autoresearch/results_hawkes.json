@@ -1,0 +1,83 @@
+{
+  "files_processed": 7,
+  "markets_processed": 16,
+  "total_ticks": 0,
+  "trades_taken": 0,
+  "wins": 0,
+  "losses": 0,
+  "win_rate": 0.0,
+  "avg_win": 0.0,
+  "avg_loss": 0.0,
+  "profit_factor": 0.0,
+  "starting_capital": 5.0,
+  "ending_capital": 5.0,
+  "total_pnl": 0.0,
+  "total_pnl_pct": 0.0,
+  "max_drawdown": 0.0,
+  "bankroll_history": [
+    [
+      "btc-updown-5m-1774134900",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774135200",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774135500",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774138500",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774137900",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774137600",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774138200",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774141800",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774141500",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774141200",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774142100",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774259700",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774259100",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774260000",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774259400",
+      5.0
+    ],
+    [
+      "btc-updown-5m-1774260300",
+      5.0
+    ]
+  ]
+}

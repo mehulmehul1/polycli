@@ -41,17 +41,17 @@ pub struct BookValueConfig {
 impl Default for BookValueConfig {
     fn default() -> Self {
         Self {
-            entry_threshold: 1.2,
+            entry_threshold: 1.6,
             take_profit_pct: 0.08,
             stop_loss_pct: 0.06,
-            min_seconds_between_entries: 30,
-            min_time_remaining: 60,
-            zscore_window: 50,
+            min_seconds_between_entries: 15,
+            min_time_remaining: 120,
+            zscore_window: 40,
             max_entry_prob: 0.85,
             min_entry_prob: 0.15,
-            w_obi: 0.4,
-            w_vamp: 0.3,
-            w_reversion: 0.3,
+            w_obi: 0.7,
+            w_vamp: 0.15,
+            w_reversion: 0.15,
             min_book_sum: 0.97,
             max_book_sum: 1.03,
         }
