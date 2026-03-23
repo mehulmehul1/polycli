@@ -450,8 +450,8 @@ impl HawkesFlowEngine {
         // HEAI reversal exit
         if let Some(dir) = self.entry_direction {
             let heai_against = match dir {
-                Direction::Yes => heai < -0.10,
-                Direction::No => heai > 0.10,
+                Direction::Yes => heai < -0.08,
+                Direction::No => heai > 0.08,
             };
             if heai_against {
                 return Some(ExitReason::MomentumReversal);
