@@ -47,7 +47,7 @@ pub struct HawkesFlowConfig {
 impl Default for HawkesFlowConfig {
     fn default() -> Self {
         Self {
-            kernel_decay: 0.3,      // 330ms half-life — more responsive to recent flow
+            kernel_decay: 0.5,      // 500ms half-life
             min_heai: 0.05,         // 5% asymmetry — filter weakest signals only
             max_heai: 0.60,         // 60% for max confidence
             vpin_threshold: 0.05,   // VPIN > 0.05 = flow is present
