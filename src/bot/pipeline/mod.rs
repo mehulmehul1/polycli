@@ -5,6 +5,7 @@ use crate::bot::logging::{EngineEvent, EngineEventLoggers};
 use crate::bot::risk::{best_ask_price, best_bid_price, decimal_to_f64, midpoint_price, GatekeeperState};
 use crate::bot::shadow::{ShadowPosition, ShadowStepResult, TokenSide};
 use crate::bot::signal::{EntrySignal, SignalEngine};
+use crate::bot::strategy::{HawkesFlowConfig, HawkesFlowEngine, StrategyEngine, StrategyDecision, Direction, Observation};
 use crate::bot::strategy_runner::run_shadow_strategy_step;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc, Timelike};
@@ -248,6 +249,8 @@ pub enum BtStrategy {
     LateWindow,
     /// Fair value: Logit jump-diffusion model for edge trading
     FairValue,
+    /// Hawkes flow: order flow self/cross-excitation dynamics with VPIN toxicity gate
+    HawkesFlow,
 }
 
 #[derive(Args, Clone)]
@@ -1358,6 +1361,119 @@ pub fn process_fairvalue_snapshot(
     }
 }
 
+/// Process a single snapshot using the Hawkes Flow Excitation strategy:
+/// 1. Build Observation from snapshot data
+/// 2. Feed to HawkesFlowEngine.decide()
+/// 3. Handle entry/exit based on StrategyDecision
+pub fn process_hawkesflow_snapshot(
+    engine: &mut HawkesFlowEngine,
+    snapshot: &DualSnapshot,
+    epoch_seconds: u64,
+    market_start_ts: i64,
+    market_end_ts: i64,
+    shadow: &mut ShadowPosition,
+    metrics: &mut PipelineMetrics,
+    position_size_usd: f64,
+    verbose: bool,
+    cumulative_wins: &mut Vec<f64>,
+    cumulative_losses: &mut Vec<f64>,
+) {
+    let yes_mid = midpoint_price(&snapshot.yes).unwrap_or(0.5);
+    let time_remaining = (market_end_ts - epoch_seconds as i64).max(0);
+
+    if time_remaining <= 0 {
+        return;
+    }
+
+    let yes_bid = best_bid_price(&snapshot.yes).unwrap_or(0.0);
+    let yes_ask = best_ask_price(&snapshot.yes).unwrap_or(1.0);
+    let no_bid = best_bid_price(&snapshot.no).unwrap_or(0.0);
+    let no_ask = best_ask_price(&snapshot.no).unwrap_or(1.0);
+    let book_sum = yes_ask + no_ask;
+
+    let obs = Observation {
+        ts: epoch_seconds as i64,
+        condition_id: String::new(),
+        market_slug: String::new(),
+        yes_bid,
+        yes_ask,
+        no_bid,
+        no_ask,
+        yes_mid,
+        no_mid: 1.0 - yes_mid,
+        book_sum,
+        time_remaining_s: time_remaining,
+        indicator_5s: IndicatorState {
+            bb_width: Some(yes_ask - yes_bid), // use spread as vol proxy
+            ..Default::default()
+        },
+        indicator_1m: IndicatorState::default(),
+        fair_value_prob: None,
+        qlib_score: None,
+    };
+
+    let decision = engine.decide(&obs);
+
+    // Debug: show entry/exit decisions
+    match &decision {
+        StrategyDecision::Enter { direction, .. } => {
+            println!("[HAWKES] ENTER {:?} | mid={:.4}", direction, yes_mid);
+        }
+        StrategyDecision::Exit { .. } => {
+            println!("[HAWKES] EXIT | mid={:.4}", yes_mid);
+        }
+        _ => {}
+    }
+
+    match decision {
+        StrategyDecision::Enter { direction, reason } => {
+            if !shadow.is_active() {
+                let (side, entry_price, entry_signal) = match direction {
+                    Direction::Yes => (TokenSide::Yes, yes_ask, EntrySignal::Long),
+                    Direction::No => (TokenSide::No, no_ask, EntrySignal::Short),
+                };
+                shadow.token_side = Some(side);
+                shadow.active_entry = Some(entry_signal);
+                shadow.entry_price = entry_price;
+                shadow.size = 1.0;
+                shadow.position_size_usd = position_size_usd;
+                shadow.bankroll_usd -= position_size_usd;
+                shadow.entry_timestamp = epoch_seconds;
+                if verbose {
+                    println!("[HAWKES ENTRY] {:?} @ {:.4} | {} | Bankroll: ${:.2}",
+                        direction, entry_price, reason.detail, shadow.bankroll_usd);
+                }
+            }
+        }
+        StrategyDecision::Exit { reason, .. } => {
+            if shadow.is_active() {
+                let exit_price = match shadow.token_side {
+                    Some(TokenSide::Yes) => best_bid_price(&snapshot.yes).unwrap_or(0.0),
+                    Some(TokenSide::No) => best_bid_price(&snapshot.no).unwrap_or(0.0),
+                    _ => 0.0,
+                };
+                let pnl = shadow.pnl(exit_price);
+                let dollar_pnl = pnl * shadow.position_size_usd;
+                shadow.bankroll_usd += shadow.position_size_usd + dollar_pnl;
+                metrics.trades_taken += 1;
+                if dollar_pnl >= 0.0 {
+                    metrics.wins += 1;
+                    cumulative_wins.push(dollar_pnl);
+                } else {
+                    metrics.losses += 1;
+                    cumulative_losses.push(dollar_pnl);
+                }
+                if verbose {
+                    println!("[HAWKES EXIT] {:.4}% | ${:.4} | Bankroll: ${:.2}",
+                        pnl * 100.0, dollar_pnl, shadow.bankroll_usd);
+                }
+                shadow.reset(epoch_seconds);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub async fn run_backtest_pipeline(args: BacktestPipelineArgs) -> Result<()> {
     let start: DateTime<Utc> = args.start.parse().context("Invalid start time format")?;
     let end: DateTime<Utc> = args.end.parse().context("Invalid end time format")?;
@@ -1596,6 +1712,7 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
         BtStrategy::Scalper => (args.band_low, args.band_high),
         BtStrategy::LateWindow => (0.85, 0.98),
         BtStrategy::FairValue => (0.05, 0.95), // wide band, model filters instead
+        BtStrategy::HawkesFlow => (0.05, 0.95), // wide band, flow model filters instead
     };
 
     // Setup DuckDB
@@ -1644,10 +1761,11 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
 
                 metrics.total_markets += 1;
 
-                // Estimate start/end times from the data
+                // Estimate start/end times from the data (CSV timestamps are in milliseconds)
                 let min_ts = replay_rows.iter().map(|r| r.ts).fold(f64::INFINITY, f64::min);
                 let max_ts = replay_rows.iter().map(|r| r.ts).fold(f64::NEG_INFINITY, f64::max);
-                let start_ts = (min_ts.floor() as i64) - ((min_ts.floor() as i64) % 300);
+                let min_ts_s = min_ts / 1000.0; // ms to s
+                let start_ts = (min_ts_s.floor() as i64) - ((min_ts_s.floor() as i64) % 300);
                 let end_ts = start_ts + 300;
 
                 let discovered = DiscoveredMarket {
@@ -1677,6 +1795,7 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
                     let base_model = FairValueModel::default();
                     CalibratedFairValue::with_defaults(base_model)
                 };
+                let mut hawkesflow_engine = HawkesFlowEngine::with_config(HawkesFlowConfig::default());
 
                 let snapshots = build_replay_snapshots(&replay_rows, ReplayMode::EventByEvent);
                 let mut replay_source = ReplaySnapshotSource::new(snapshots);
@@ -1687,9 +1806,9 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
                 while let Some(snapshot) = replay_source.next_snapshot().await? {
                     last_yes_bid = snapshot.yes.best_bid.map(decimal_to_f64).unwrap_or(last_yes_bid);
                     last_no_bid = snapshot.no.best_bid.map(decimal_to_f64).unwrap_or(last_no_bid);
-                    let epoch_seconds = replay_source
+                    let epoch_seconds = (replay_source
                         .current_time()
-                        .unwrap_or_else(|| snapshot.ts_exchange.floor() as u64);
+                        .unwrap_or_else(|| snapshot.ts_exchange.floor() as u64)) / 1000; // ms to s
 
                     if args.strategy == BtStrategy::FairValue {
                         process_fairvalue_snapshot(
@@ -1705,6 +1824,20 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
                             &mut metrics,
                             args.size,
                             args.min_edge,
+                            args.verbose,
+                            &mut cumulative_wins,
+                            &mut cumulative_losses,
+                        );
+                    } else if args.strategy == BtStrategy::HawkesFlow {
+                        process_hawkesflow_snapshot(
+                            &mut hawkesflow_engine,
+                            &snapshot,
+                            epoch_seconds,
+                            discovered.start_ts,
+                            discovered.end_ts,
+                            &mut shadow,
+                            &mut metrics,
+                            args.size,
                             args.verbose,
                             &mut cumulative_wins,
                             &mut cumulative_losses,
@@ -1788,6 +1921,7 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
                 let base_model = FairValueModel::default();
                 CalibratedFairValue::with_defaults(base_model)
             };
+            let mut hawkesflow_engine = HawkesFlowEngine::with_config(HawkesFlowConfig::default());
 
             // Query ticks for this market
             let tick_sql = format!(
@@ -1859,6 +1993,20 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
                         &mut metrics,
                         args.size,
                         args.min_edge,
+                        args.verbose,
+                        &mut cumulative_wins,
+                        &mut cumulative_losses,
+                    );
+                } else if args.strategy == BtStrategy::HawkesFlow {
+                    process_hawkesflow_snapshot(
+                        &mut hawkesflow_engine,
+                        &snapshot,
+                        epoch_seconds,
+                        market.start_ts,
+                        market.end_ts,
+                        &mut shadow,
+                        &mut metrics,
+                        args.size,
                         args.verbose,
                         &mut cumulative_wins,
                         &mut cumulative_losses,

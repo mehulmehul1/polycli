@@ -95,7 +95,7 @@ impl TickRecorder {
                 market_slug.to_string(),
                 format!("{:.6}", yes_bid),
                 format!("{:.6}", yes_ask),
-                format!("{:.6}", no_ask),
+                format!("{:.6}", no_bid),
                 format!("{:.6}", no_ask),
                 format!("{}", time_remaining),
             ]);
