@@ -42,6 +42,10 @@ pub struct HawkesFlowConfig {
     pub min_bb_width: f64,
     /// Cooldown after exit (observations)
     pub cooldown_observations: usize,
+    /// Take profit threshold (positive, e.g. 0.30 = 30%)
+    pub base_tp_pct: f64,
+    /// Stop loss threshold (negative, e.g. -0.10 = -10%)
+    pub base_sl_pct: f64,
 }
 
 impl Default for HawkesFlowConfig {
@@ -57,6 +61,8 @@ impl Default for HawkesFlowConfig {
             min_entry_prob: 0.15,
             min_bb_width: 0.0,        // spread proxy — don't gate on this
             cooldown_observations: 3, // 3 observations after exit
+            base_tp_pct: 0.30,        // 30% take profit — prediction market winners go to $1
+            base_sl_pct: -0.10,       // 10% stop loss — wider for noisy PM prices
         }
     }
 }
@@ -428,13 +434,13 @@ impl HawkesFlowEngine {
                 Direction::Yes => p - entry_price,
                 Direction::No => entry_price - p,
             };
-            if move_in_favor > 0.12 {
+            if move_in_favor > self.config.base_tp_pct {
                 return Some(ExitReason::TakeProfit {
                     pnl_pct: move_in_favor * 100.0,
                 });
             }
             // Stop loss
-            if move_in_favor < -0.06 {
+            if move_in_favor < self.config.base_sl_pct {
                 return Some(ExitReason::StopLoss {
                     pnl_pct: move_in_favor * 100.0,
                 });
