@@ -56,7 +56,7 @@ impl Default for HawkesFlowConfig {
             max_heai: 0.60,         // 60% for max confidence
             vpin_threshold: 0.05,   // VPIN > 0.05 = flow is present
             vpin_window: 50,        // 50 price updates for VPIN
-            min_time_remaining: 30, // 30 seconds — enter earlier
+            min_time_remaining: 45, // 45 seconds minimum
             max_entry_prob: 0.88,
             min_entry_prob: 0.15,
             min_bb_width: 0.0,        // spread proxy — don't gate on this
