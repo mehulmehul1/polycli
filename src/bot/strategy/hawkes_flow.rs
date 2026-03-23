@@ -56,7 +56,7 @@ impl Default for HawkesFlowConfig {
             max_entry_prob: 0.88,
             min_entry_prob: 0.12,
             min_bb_width: 0.0,        // spread proxy — don't gate on this
-            cooldown_observations: 2, // 2 observations after exit (faster re-entry)
+            cooldown_observations: 3, // 3 observations after exit
         }
     }
 }
