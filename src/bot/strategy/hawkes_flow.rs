@@ -52,7 +52,7 @@ impl Default for HawkesFlowConfig {
     fn default() -> Self {
         Self {
             kernel_decay: 0.5,      // 500ms half-life
-            min_heai: 0.05,         // 5% asymmetry — filter weakest signals only
+            min_heai: 0.04,         // 4% asymmetry — more entries with PM TP/SL
             max_heai: 0.60,         // 60% for max confidence
             vpin_threshold: 0.05,   // VPIN > 0.05 = flow is present
             vpin_window: 50,        // 50 price updates for VPIN
