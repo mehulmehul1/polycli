@@ -62,7 +62,7 @@ impl Default for HawkesFlowConfig {
             min_bb_width: 0.0,        // spread proxy — don't gate on this
             cooldown_observations: 3, // 3 observations after exit
             base_tp_pct: 0.30,        // 30% take profit — prediction market winners go to $1
-            base_sl_pct: -0.10,       // 10% stop loss — wider for noisy PM prices
+            base_sl_pct: -0.15,       // 15% stop — wider for PM volatility
         }
     }
 }
