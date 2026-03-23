@@ -1,0 +1,374 @@
+﻿cargo :     Checking polymarket-cli v0.1.4 
+(C:\Users\mehul\OneDrive\Desktop\Studio\PROJECTS\polycli\polycli)
+At line:1 char:1
++ cargo check 2>&1 | Out-File -FilePath check_results.txt -Encoding utf ...
++ ~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Checking po...olycli\polycli):String) [], Remot 
+   eException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+error[E0603]: enum import `FusionMode` is private
+   --> src\bot\research\mod.rs:21:18
+    |
+ 21 | pub use fusion::{FusionMode, FusionEngine, FusionConfig, FusionDecision};
+    |                  ^^^^^^^^^^ private enum import
+    |
+note: the enum import `FusionMode` is defined here...
+   --> src\bot\research\fusion.rs:8:18
+    |
+  8 |     Observation, FusionMode,
+    |                  ^^^^^^^^^^
+note: ...and refers to the enum import `FusionMode` which is defined here...
+   --> src\bot\strategy\mod.rs:9:9
+    |
+  9 | pub use types::*;
+    |         ^^^^^^^^ you could import this re-export
+note: ...and refers to the enum `FusionMode` which is defined here
+   --> src\bot\strategy\types.rs:136:1
+    |
+136 | pub enum FusionMode {
+    | ^^^^^^^^^^^^^^^^^^^ you could import this directly
+help: import `FusionMode` through the re-export
+    |
+ 21 | pub use fusion::{bot::strategy::FusionMode, FusionEngine, FusionConfig, FusionDecision};
+    |                  +++++++++++++++
+
+warning: unused import: `BeckerParser`
+ --> src\bot\backtest\replay.rs:1:34
+  |
+1 | use crate::bot::backtest::data::{BeckerParser, MarketData, PriceSnapshot};
+  |                                  ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `anyhow::Result`
+ --> src\bot\backtest\replay.rs:7:5
+  |
+7 | use anyhow::Result;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused imports: `MarketData` and `Trade`
+ --> src\bot\backtest\mod.rs:6:30
+  |
+6 | pub use data::{BeckerParser, MarketData, Trade};
+  |                              ^^^^^^^^^^  ^^^^^
+
+warning: unused imports: `BacktestMetrics` and `TradeResult`
+ --> src\bot\backtest\mod.rs:7:19
+  |
+7 | pub use metrics::{BacktestMetrics, TradeResult};
+  |                   ^^^^^^^^^^^^^^^  ^^^^^^^^^^^
+
+warning: unused imports: `PmxtRow` and `fetch_btc_updown`
+ --> src\bot\backtest\mod.rs:8:16
+  |
+8 | pub use pmxt::{fetch_btc_updown, PmxtFetcher, PmxtRow};
+  |                ^^^^^^^^^^^^^^^^               ^^^^^^^
+
+warning: unused imports: `Args` and `ValueEnum`
+ --> src\bot\discovery\mod.rs:3:12
+  |
+3 | use clap::{Args, ValueEnum};
+  |            ^^^^  ^^^^^^^^^
+
+warning: unused import: `polymarket_client_sdk::clob::types::response::MarketResponse`
+ --> src\bot\discovery\mod.rs:8:5
+  |
+8 | use polymarket_client_sdk::clob::types::response::MarketResponse;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Deserialize` and `Serialize`
+  --> src\bot\discovery\mod.rs:15:13
+   |
+15 | use serde::{Deserialize, Serialize};
+   |             ^^^^^^^^^^^  ^^^^^^^^^
+
+warning: unused imports: `gamma_market_condition_id_hex`, `has_binary_directional_tokens`, 
+`hour_btc_5m_slugs`, `infer_market_window`, `is_updown_5m_text`, `market_matches_exact_filter`, 
+`matches_crypto_text`, `parse_slug_timestamp`, and `window_overlaps_hour`
+  --> src\bot\discovery\mod.rs:24:5
+   |
+24 |     gamma_market_condition_id_hex, hour_btc_5m_slugs, is_updown_5m_text,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+25 |     market_matches_exact_filter, matches_crypto_text,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^
+26 |     has_binary_directional_tokens, infer_market_window, parse_slug_timestamp,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^
+27 |     window_overlaps_hour,
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::bot::pipeline::CryptoAsset`
+  --> src\bot\discovery\mod.rs:34:9
+   |
+34 | pub use crate::bot::pipeline::CryptoAsset;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::bot::pipeline::DiscoveredMarket`
+  --> src\bot\discovery\mod.rs:47:9
+   |
+47 | pub use crate::bot::pipeline::DiscoveredMarket;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::bot::pipeline::GammaMarket`
+  --> src\bot\discovery\mod.rs:49:9
+   |
+49 | pub use crate::bot::pipeline::GammaMarket;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SimulationResult`
+ --> src\bot\monte_carlo\mod.rs:3:60
+  |
+3 | pub use simulator::{MonteCarloSimulator, SimulationConfig, SimulationResult};
+  |                                                            ^^^^^^^^^^^^^^^^
+
+warning: unused imports: `FairValueConfig` and `FairValueModel`
+ --> src\bot\pricing\mod.rs:8:22
+  |
+8 | pub use fair_value::{FairValueModel, FairValueConfig};
+  |                      ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused imports: `VolSurface` and `VolatilityCalculator`
+ --> src\bot\pricing\mod.rs:9:22
+  |
+9 | pub use volatility::{VolatilityCalculator, VolSurface};
+  |                      ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^
+
+warning: unused import: `Serialize`
+ --> src\bot\research\config.rs:3:26
+  |
+3 | use serde::{Deserialize, Serialize};
+  |                          ^^^^^^^^^
+
+warning: unused import: `std::str::FromStr`
+ --> src\bot\research\market_spec.rs:6:5
+  |
+6 | use std::str::FromStr;
+  |     ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `parquet::file::writer::SerializedFileWriter`
+ --> src\bot\research\feature_export.rs:7:5
+  |
+7 | use parquet::file::writer::SerializedFileWriter;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Serialize`
+ --> src\bot\research\labeling.rs:6:26
+  |
+6 | use serde::{Deserialize, Serialize};
+  |                          ^^^^^^^^^
+
+warning: unused import: `std::collections::VecDeque`
+ --> src\bot\research\labeling.rs:7:5
+  |
+7 | use std::collections::VecDeque;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Row`
+ --> src\bot\research\score_loader.rs:8:23
+  |
+8 | use parquet::record::{Row, RowAccessor};
+  |                       ^^^
+
+warning: unused import: `ScoreRow`
+ --> src\bot\research\fusion.rs:5:26
+  |
+5 | use super::{ScoreLoader, ScoreRow};
+  |                          ^^^^^^^^
+
+warning: unused imports: `Confidence`, `EntryReason`, and `StrategyEngine`
+ --> src\bot\research\fusion.rs:7:5
+  |
+7 |     Confidence, Direction, EntryReason, SignalSource, StrategyDecision, StrategyEngine,
+  |     ^^^^^^^^^^             ^^^^^^^^^^^                                  ^^^^^^^^^^^^^^
+
+warning: unused import: `Serialize`
+  --> src\bot\research\fusion.rs:10:26
+   |
+10 | use serde::{Deserialize, Serialize};
+   |                          ^^^^^^^^^
+
+warning: unnecessary parentheses around assigned value
+   --> src\bot\research\fusion.rs:170:40
+    |
+170 |                 let fused_confidence = (heuristic.confidence * (1.0 - 
+self.config.qlib_weight)
+    |                                        ^
+171 |                     + qlib.confidence * self.config.qlib_weight);
+    |                                                                ^
+    |
+    = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+    |
+170 ~                 let fused_confidence = heuristic.confidence * (1.0 - 
+self.config.qlib_weight)
+171 ~                     + qlib.confidence * self.config.qlib_weight;
+    |
+
+warning: unused imports: `MarketFamily`, `SupportedAsset`, and `SupportedDuration`
+  --> src\bot\research\mod.rs:16:47
+   |
+16 | pub use market_spec::{CryptoBinaryMarketSpec, MarketFamily, SupportedAsset, 
+SupportedDuration};
+   |                                               ^^^^^^^^^^^^  ^^^^^^^^^^^^^^  
+^^^^^^^^^^^^^^^^^
+
+warning: unused import: `FusionDecision`
+  --> src\bot\research\mod.rs:21:58
+   |
+21 | pub use fusion::{FusionMode, FusionEngine, FusionConfig, FusionDecision};
+   |                                                          ^^^^^^^^^^^^^^
+
+warning: unused imports: `ExitSignal` and `Observation`
+ --> src\bot\strategy\heuristic.rs:6:66
+  |
+6 |     Confidence, Direction, EntryReason, EntrySignal, ExitReason, ExitSignal, Observation,
+  |                                                                  ^^^^^^^^^^  ^^^^^^^^^^^
+
+warning: unused import: `Serialize`
+ --> src\bot\strategy\risk.rs:5:26
+  |
+5 | use serde::{Deserialize, Serialize};
+  |                          ^^^^^^^^^
+
+warning: unused import: `risk::RiskGate`
+  --> src\bot\strategy\mod.rs:11:9
+   |
+11 | pub use risk::RiskGate;
+   |         ^^^^^^^^^^^^^^
+
+error[E0061]: this function takes 3 arguments but 2 arguments were supplied
+    --> src\bot\pipeline\mod.rs:1111:34
+     |
+1111 |             let mut gatekeeper = GatekeeperState::new(args.size * 3.0, 15);
+     |                                  ^^^^^^^^^^^^^^^^^^^^ --------------- argument #1 of type 
+`bot::strategy::types::StrategyMode` is missing
+     |
+note: associated function defined here
+    --> src\bot\risk.rs:64:12
+     |
+  64 |     pub fn new(mode: StrategyMode, daily_loss_limit: f64, cooldown_seconds: u64) -> Self {
+     |            ^^^ ------------------
+help: provide the argument
+     |
+1111 |             let mut gatekeeper = GatekeeperState::new(/* 
+bot::strategy::types::StrategyMode */, args.size * 3.0, 15);
+     |                                                       
++++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: `std::result::Result<(), anyhow::Error>` is not a future
+   --> src\commands\bot.rs:248:89
+    |
+248 |         BotCommand::InspectFeatures(inspect_args) => 
+run_inspect_features(inspect_args).await,
+    |                                                      ---------------------------------- 
+^^^^^ `std::result::Result<(), anyhow::Error>` is not a future
+    |                                                      |
+    |                                                      this call returns 
+`std::result::Result<(), anyhow::Error>`
+    |
+    = help: the trait `futures_util::Future` is not implemented for `std::result::Result<(), 
+anyhow::Error>`
+    = note: std::result::Result<(), anyhow::Error> must be a future or must implement 
+`IntoFuture` to be awaited
+    = note: required for `std::result::Result<(), anyhow::Error>` to implement 
+`std::future::IntoFuture`
+help: remove the `.await`
+    |
+248 -         BotCommand::InspectFeatures(inspect_args) => 
+run_inspect_features(inspect_args).await,
+248 +         BotCommand::InspectFeatures(inspect_args) => run_inspect_features(inspect_args),
+    |
+help: alternatively, consider making `fn run_inspect_features` asynchronous
+    |
+861 | async fn run_inspect_features(args: InspectFeaturesArgs) -> Result<()> {
+    | +++++
+
+error[E0308]: mismatched types
+   --> src\commands\bot.rs:852:41
+    |
+852 |         .export(&args.input, &args.out, &manifest_path)?;
+    |          ------ -----------  ---------  ^^^^^^^^^^^^^^ expected `&String`, found `&PathBuf`
+    |          |      |            |
+    |          |      |            expected some other arguments to be an `&std::string::String` 
+type to match the type of this parameter
+    |          |      expected some other arguments to be an `&std::string::String` type to 
+match the type of this parameter
+    |          arguments to this method are incorrect
+    |
+    = note: expected reference `&std::string::String`
+               found reference `&PathBuf`
+note: method defined here
+   --> src\bot\research\feature_export.rs:30:12
+    |
+ 30 |     pub fn export<P: AsRef<Path>>(
+    |            ^^^^^^ - `input_path`, `output_path` and `manifest_path` all reference this 
+parameter `P`
+ 31 |         &self,
+ 32 |         input_path: P,
+    |         ------------- `manifest_path` needs to match the `&std::string::String` type of 
+this parameter
+ 33 |         output_path: P,
+    |         -------------- `manifest_path` needs to match the `&std::string::String` type of 
+this parameter
+ 34 |         manifest_path: P,
+    |         ---------------- this parameter needs to match the `&std::string::String` type of 
+`input_path` and `output_path`
+
+error[E0382]: borrow of moved value: `condition_id`
+   --> src\bot\research\feature_export.rs:100:51
+    |
+ 73 |             let condition_id: String = row.get_string(0).map(|s| 
+s.to_string()).unwrap_or_default();
+    |                 ------------ move occurs because `condition_id` has type 
+`std::string::String`, which does not implement the `Copy` trait
+...
+ 99 |                 condition_id,
+    |                 ------------ value moved here
+100 |                 market_slug: format!("{}-market", condition_id),
+    |                                                   ^^^^^^^^^^^^ value borrowed here after 
+move
+    |
+    = note: this error originates in the macro `$crate::__export::format_args` which comes from 
+the expansion of the macro `format` (in Nightly builds, run with -Z macro-backtrace for more 
+info)
+help: consider cloning the value if the performance cost is acceptable
+    |
+ 99 |                 condition_id: condition_id.clone(),
+    |                             ++++++++++++++++++++++
+
+warning: unused variable: `row`
+  --> src\bot\research\labeling.rs:65:21
+   |
+65 |                 let row = &rows[i];
+   |                     ^^^ help: if this is intentional, prefix it with an underscore: `_row`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `one_min`
+   --> src\bot\signal.rs:128:9
+    |
+128 |         one_min: &IndicatorState,
+    |         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_one_min`
+
+warning: value assigned to `state_5s` is never read
+   --> src\commands\bot.rs:589:24
+    |
+589 |     let mut state_5s = IndicatorState::default();
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `state_5s` is never read
+   --> src\commands\bot.rs:694:21
+    |
+694 |                     state_5s = IndicatorState::default();
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+Some errors have detailed explanations: E0061, E0277, E0308, E0382, E0603.
+For more information about an error, try `rustc --explain E0061`.
+warning: `polymarket-cli` (bin "polymarket") generated 34 warnings
+error: could not compile `polymarket-cli` (bin "polymarket") due to 5 previous errors; 34 
+warnings emitted

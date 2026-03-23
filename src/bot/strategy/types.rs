@@ -24,6 +24,12 @@ pub enum SignalSource {
     QlibScore,
     /// Fused combination of multiple sources
     Fused,
+    /// Hawkes flow excitation asymmetry
+    HawkesFlow,
+    /// BookValue: OBI + VAMP + mean reversion fusion
+    BookValue,
+    /// CandleClock: time-of-day + candle boundary effect
+    CandleClock,
 }
 
 /// Confidence level for entry decision

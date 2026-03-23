@@ -1,0 +1,35 @@
+{"type":"gate_decision","ts":1773522114,"market_slug":"btc-updown-5m-1773522000","decision":"approved","reason":"FairValue Yes entry approved (daily_pnl=0.00, cooldown_until=None)"}
+{"type":"gate_decision","ts":1773522305,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Time"}
+{"type":"gate_decision","ts":1773522306,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Time"}
+{"type":"gate_decision","ts":1773522307,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Time"}
+{"type":"gate_decision","ts":1773522308,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Time"}
+{"type":"gate_decision","ts":1773522309,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Time"}
+{"type":"gate_decision","ts":1773522310,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Time"}
+{"type":"gate_decision","ts":1773522311,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Time"}
+{"type":"gate_decision","ts":1773522312,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Time"}
+{"type":"gate_decision","ts":1773522312,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Time"}
+{"type":"gate_decision","ts":1773522313,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Time"}
+{"type":"gate_decision","ts":1773522315,"market_slug":"btc-updown-5m-1773522300","decision":"approved","reason":"FairValue Yes entry approved (daily_pnl=-0.76, cooldown_until=Some(1773522201))"}
+{"type":"gate_decision","ts":1773522424,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522425,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522426,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522426,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522428,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522429,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522430,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522431,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522432,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522433,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522434,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522434,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522435,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522436,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522437,"market_slug":"btc-updown-5m-1773522300","decision":"blocked","reason":"Cooldown"}
+{"type":"gate_decision","ts":1773522439,"market_slug":"btc-updown-5m-1773522300","decision":"approved","reason":"FairValue Yes entry approved (daily_pnl=-1.57, cooldown_until=Some(1773522438))"}
+{"type":"gate_decision","ts":1773522531,"market_slug":"btc-updown-5m-1773522300","decision":"approved","reason":"FairValue Yes entry approved (daily_pnl=-2.01, cooldown_until=Some(1773522529))"}
+{"type":"gate_decision","ts":1773522604,"market_slug":"btc-updown-5m-1773522600","decision":"blocked","reason":"Time"}
+{"type":"gate_decision","ts":1773522605,"market_slug":"btc-updown-5m-1773522600","decision":"blocked","reason":"Time"}
+{"type":"gate_decision","ts":1773522606,"market_slug":"btc-updown-5m-1773522600","decision":"blocked","reason":"Time"}
+{"type":"gate_decision","ts":1773522675,"market_slug":"btc-updown-5m-1773522600","decision":"approved","reason":"FairValue Yes entry approved (daily_pnl=-2.76, cooldown_until=Some(1773522554))"}
+{"type":"gate_decision","ts":1773522781,"market_slug":"btc-updown-5m-1773522600","decision":"approved","reason":"FairValue Yes entry approved (daily_pnl=-2.68, cooldown_until=Some(1773522554))"}
+{"type":"gate_decision","ts":1773522786,"market_slug":"btc-updown-5m-1773522600","decision":"approved","reason":"FairValue Yes entry approved (daily_pnl=-2.59, cooldown_until=Some(1773522554))"}

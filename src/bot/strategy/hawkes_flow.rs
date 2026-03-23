@@ -55,7 +55,7 @@ impl Default for HawkesFlowConfig {
             min_time_remaining: 45, // 45 seconds minimum
             max_entry_prob: 0.88,
             min_entry_prob: 0.12,
-            min_bb_width: 0.01,       // minimum spread (0.01 = 1%)
+            min_bb_width: 0.0,        // spread proxy — don't gate on this
             cooldown_observations: 3, // 3 observations after exit
         }
     }
@@ -102,7 +102,7 @@ impl HawkesEstimator {
     fn update(&mut self, event: FlowEvent) {
         // Decay existing intensity since last update
         if let Some(last) = self.last_ts {
-            let dt = (event.timestamp - last) as f64 / 1000.0; // convert ms to seconds
+            let dt = (event.timestamp - last) as f64 / 1000.0; // ms to seconds
             if dt > 0.0 {
                 self.current_intensity =
                     self.mu + (self.current_intensity - self.mu) * (-self.beta * dt).exp();
@@ -116,7 +116,7 @@ impl HawkesEstimator {
         self.last_ts = Some(event.timestamp);
 
         // Keep only recent events (last 60 seconds)
-        let cutoff = event.timestamp - 60_000;
+        let cutoff = event.timestamp - 60;
         while self.events.front().map_or(false, |e| e.timestamp < cutoff) {
             self.events.pop_front();
         }
@@ -130,7 +130,7 @@ impl HawkesEstimator {
     /// Decay intensity to a future timestamp
     fn intensity_at(&self, future_ts: i64) -> f64 {
         if let Some(last) = self.last_ts {
-            let dt = (future_ts - last) as f64 / 1000.0;
+            let dt = (future_ts - last) as f64 / 1000.0; // ms to seconds
             if dt > 0.0 {
                 return self.mu + (self.current_intensity - self.mu) * (-self.beta * dt).exp();
             }

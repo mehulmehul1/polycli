@@ -312,6 +312,30 @@ impl WebsocketSnapshotSource {
     pub async fn shutdown(self) {
         self.feed.shutdown().await;
     }
+
+    /// Wait for the NEXT single WebSocket event, apply it, return snapshot.
+    /// True event-by-event processing — blocks until an event arrives.
+    pub async fn recv_next(&mut self) -> Option<DualSnapshot> {
+        let event = self.feed.recv().await?;
+        self.book_state.apply(&event);
+        self.last_ts = Some(event.ts_exchange.floor() as u64);
+        self.book_state.snapshot()
+    }
+
+    /// Drain all pending events, process each through callback, return final snapshot.
+    /// Use this to drain backlog between strategy processing.
+    pub fn try_recv_all<F: FnMut(DualSnapshot)>(&mut self, mut on_snapshot: F) -> Option<DualSnapshot> {
+        let mut last = None;
+        while let Some(event) = self.feed.try_recv() {
+            self.book_state.apply(&event);
+            self.last_ts = Some(event.ts_exchange.floor() as u64);
+            if let Some(snap) = self.book_state.snapshot() {
+                on_snapshot(snap.clone());
+                last = Some(snap);
+            }
+        }
+        last
+    }
 }
 
 impl StrategyInputSource for WebsocketSnapshotSource {
@@ -356,6 +380,28 @@ impl<'a> LiveStrategyInputSource<'a> {
     pub async fn shutdown(self) {
         if let Self::Websocket(source) = self {
             source.shutdown().await;
+        }
+    }
+
+    pub fn is_websocket(&self) -> bool {
+        matches!(self, Self::Websocket(_))
+    }
+
+    /// Event-by-event: wait for next WebSocket event and return snapshot.
+    /// Returns None if Poll variant (call next_snapshot instead).
+    pub async fn recv_next(&mut self) -> Option<DualSnapshot> {
+        match self {
+            Self::Websocket(source) => source.recv_next().await,
+            Self::Poll(_) => None,
+        }
+    }
+
+    /// Drain pending WebSocket events, process each through callback, return final snapshot.
+    /// Returns None if Poll variant.
+    pub fn try_recv_all<F: FnMut(DualSnapshot)>(&mut self, on_snapshot: F) -> Option<DualSnapshot> {
+        match self {
+            Self::Websocket(source) => source.try_recv_all(on_snapshot),
+            Self::Poll(_) => None,
         }
     }
 }

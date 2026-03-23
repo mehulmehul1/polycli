@@ -310,6 +310,9 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
         crate::bot::pipeline::BtStrategy::Scalper => (0.35, 0.65),
         crate::bot::pipeline::BtStrategy::LateWindow => (0.85, 0.98),
         crate::bot::pipeline::BtStrategy::FairValue => (0.05, 0.95),
+        crate::bot::pipeline::BtStrategy::HawkesFlow => (0.05, 0.95),
+        crate::bot::pipeline::BtStrategy::BookValue => (0.05, 0.95),
+        crate::bot::pipeline::BtStrategy::CandleClock => (0.05, 0.95),
     };
     let mut signal_engine = SignalEngine::new_with_band(band_low, band_high);
 
@@ -342,6 +345,24 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
     let mut fv_cumulative_wins: Vec<f64> = Vec::new();
     let mut fv_cumulative_losses: Vec<f64> = Vec::new();
 
+    // HawkesFlow state
+    let mut hawkes_engine = crate::bot::strategy::HawkesFlowEngine::new();
+    let mut hawkes_metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd);
+    let mut hawkes_cumulative_wins: Vec<f64> = Vec::new();
+    let mut hawkes_cumulative_losses: Vec<f64> = Vec::new();
+
+    // BookValue state
+    let mut bookvalue_engine = crate::bot::strategy::BookValueEngine::new();
+    let mut bookvalue_metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd);
+    let mut bookvalue_cumulative_wins: Vec<f64> = Vec::new();
+    let mut bookvalue_cumulative_losses: Vec<f64> = Vec::new();
+
+    // CandleClock state
+    let mut clock_engine = crate::bot::strategy::CandleClockEngine::new();
+    let mut clock_metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd);
+    let mut clock_cumulative_wins: Vec<f64> = Vec::new();
+    let mut clock_cumulative_losses: Vec<f64> = Vec::new();
+
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -358,17 +379,189 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
         None
     };
 
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                println!("\n[SHADOW] Final PnL: {:.4}%", shadow.realized_pnl * 100.0);
-                if let Some(v) = &validator {
-                    v.print_summary();
+    let is_ws = input_source.is_websocket();
+    if is_ws {
+        println!("[FEED] Event-by-event WebSocket mode");
+    } else {
+        println!("[FEED] 1Hz polling mode");
+    }
+
+    'market_loop: loop {
+    if is_ws {
+        // ─── Event-by-event WebSocket loop ───
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\n[SHADOW] Final PnL: {:.4}%", shadow.realized_pnl * 100.0);
+                    if let Some(v) = &validator {
+                        v.print_summary();
+                    }
+                    println!("Received Ctrl+C, stopping bot watch.");
+                    break 'market_loop;
                 }
-                println!("Received Ctrl+C, stopping bot watch.");
-                break;
+                result = input_source.recv_next() => {
+                    let dual_snapshot = match result {
+                        Some(snap) => snap,
+                        None => {
+                            eprintln!("[WS] Feed disconnected, reconnecting...");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+
+                    last_yes_bid = best_bid_price(&dual_snapshot.yes).unwrap_or(last_yes_bid);
+                    last_no_bid = best_bid_price(&dual_snapshot.no).unwrap_or(last_no_bid);
+                    let epoch_seconds = (dual_snapshot.ts_exchange.floor() as u64) / 1000;
+
+                    // Market expiry check (based on exchange timestamp)
+                    if epoch_seconds as i64 >= watched.end_time.timestamp() || watched.slug != current_slug {
+                        if shadow.is_active() {
+                            let price = match shadow.token_side {
+                                Some(TokenSide::Yes) => last_yes_bid,
+                                Some(TokenSide::No) => last_no_bid,
+                                None => shadow.entry_price,
+                            };
+                            let settlement_price = if price > 0.5 { 1.0 } else { 0.0 };
+                            let final_pnl = shadow.pnl(settlement_price);
+                            shadow.realized_pnl += final_pnl * shadow.size;
+                            shadow.position_realized_pnl += final_pnl * shadow.size;
+                            let dollar_pnl = final_pnl * shadow.position_size_usd;
+                            shadow.bankroll_usd += shadow.position_size_usd + dollar_pnl;
+                            shadow.realized_usd += dollar_pnl;
+                            shadow.position_realized_usd += dollar_pnl;
+                            if let Some(v) = &mut validator {
+                                let duration = (Utc::now().timestamp() as u64 - shadow.entry_timestamp) as i64;
+                                let side_str = match shadow.token_side { Some(TokenSide::Yes) => "YES".to_string(), Some(TokenSide::No) => "NO".to_string(), None => "N/A".to_string() };
+                                v.record_trade(watched.slug.clone(), side_str, shadow.entry_price, settlement_price, shadow.position_realized_pnl, duration, shadow.position_realized_usd, shadow.bankroll_usd);
+                            }
+                            let side_name = match shadow.token_side { Some(TokenSide::Yes) => "YES", Some(TokenSide::No) => "NO", None => "N/A" };
+                            println!("[SETTLEMENT] {} | {} @ {:.2} -> {:.2} | {:.4}% | Bankroll: ${:.2}",
+                                side_name, watched.slug, shadow.entry_price, settlement_price, shadow.position_realized_pnl * 100.0, shadow.bankroll_usd);
+                        }
+                        if let Some(v) = &mut validator {
+                            v.finalize_market(watched.slug.clone(), shadow.realized_pnl);
+                            if v.completed_markets >= v.max_markets { v.print_summary(); return Ok(()); }
+                        }
+                        println!("Market {} reached resolution time. Looking for next active BTC 5m market...", watched.slug);
+                        watched = discover_market_loop(&gamma_client).await;
+                        current_slug = watched.slug.clone();
+                        input_source.shutdown().await;
+                        input_source = create_live_input_source(live_args.feed, &clob_client, &watched).await
+                            .context("Failed to recreate live strategy input source")?;
+                        signal_engine.reset(); ind_1m.reset(); ind_5s.reset(); shadow.full_reset();
+                        fv_model = crate::bot::pricing::LogitJumpDiffusion::new();
+                        fv_kalman = Some(crate::bot::pricing::KalmanFilter::new(0.0));
+                        fv_jump_calibrator = Some(crate::bot::pricing::JumpCalibrator::with_defaults());
+                        fv_metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd);
+                        hawkes_engine = crate::bot::strategy::HawkesFlowEngine::new();
+                        hawkes_metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd);
+                        bookvalue_engine = crate::bot::strategy::BookValueEngine::new();
+                        bookvalue_metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd);
+                        clock_engine = crate::bot::strategy::CandleClockEngine::new();
+                        clock_metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd);
+                        state_1m = IndicatorState::default(); state_5s = IndicatorState::default();
+                        last_yes_bid = 0.0; last_no_bid = 0.0;
+                        println!("[MARKET RESET] All engines cleared | {}", watched.slug);
+                        println!("========================================");
+                        continue 'market_loop;
+                    }
+
+                    // Record tick
+                    if let Some(ref mut rec) = recorder {
+                        let time_remaining = (watched.end_time.timestamp() - epoch_seconds as i64).max(0);
+                        rec.record_tick(dual_snapshot.ts_exchange, &watched.slug, last_yes_bid,
+                            best_ask_price(&dual_snapshot.yes).unwrap_or(0.0), last_no_bid,
+                            best_ask_price(&dual_snapshot.no).unwrap_or(0.0), time_remaining);
+                    }
+
+                    // Status print (every ~10s based on timestamp)
+                    if epoch_seconds % 10 == 0 {
+                        let yb = best_bid_price(&dual_snapshot.yes).unwrap_or(0.0);
+                        let ya = best_ask_price(&dual_snapshot.yes).unwrap_or(0.0);
+                        let nb = best_bid_price(&dual_snapshot.no).unwrap_or(0.0);
+                        let na = best_ask_price(&dual_snapshot.no).unwrap_or(0.0);
+                        println!("[BOOK] YES: bid={:.4} ask={:.4} | NO: bid={:.4} ask={:.4} | mid={:.4}",
+                            yb, ya, nb, na, midpoint_price(&dual_snapshot.yes).unwrap_or(0.0));
+                    }
+
+                    // ─── Strategy processing ───
+                    if live_args.strategy == crate::bot::pipeline::BtStrategy::FairValue {
+                        let prev_trades = fv_metrics.trades_taken;
+                        crate::bot::pipeline::process_fairvalue_snapshot(
+                            &mut fv_model, &mut fv_kalman, &mut fv_jump_calibrator, &mut fv_calibrated,
+                            &dual_snapshot, epoch_seconds, watched.end_time.timestamp() - FIVE_MINUTES_SECONDS,
+                            watched.end_time.timestamp(), &mut shadow, &mut fv_metrics, 1.0, 0.05, true,
+                            &mut fv_cumulative_wins, &mut fv_cumulative_losses);
+                        if fv_metrics.trades_taken > prev_trades { if let Some(v) = &mut validator { v.record_signal(); v.record_entry_taken(); } }
+                    } else if live_args.strategy == crate::bot::pipeline::BtStrategy::HawkesFlow {
+                        let prev_trades = hawkes_metrics.trades_taken;
+                        crate::bot::pipeline::process_hawkesflow_snapshot(
+                            &mut hawkes_engine, &dual_snapshot, epoch_seconds, watched.end_time.timestamp() - FIVE_MINUTES_SECONDS,
+                            watched.end_time.timestamp(), &mut shadow, &mut hawkes_metrics, 1.0, true,
+                            &mut hawkes_cumulative_wins, &mut hawkes_cumulative_losses);
+                        if hawkes_metrics.trades_taken > prev_trades { if let Some(v) = &mut validator { v.record_signal(); v.record_entry_taken(); } }
+                    } else if live_args.strategy == crate::bot::pipeline::BtStrategy::BookValue {
+                        let prev_trades = bookvalue_metrics.trades_taken;
+                        crate::bot::pipeline::process_bookvalue_snapshot(
+                            &mut bookvalue_engine, &dual_snapshot, epoch_seconds, watched.end_time.timestamp() - FIVE_MINUTES_SECONDS,
+                            watched.end_time.timestamp(), &mut shadow, &mut bookvalue_metrics, 1.0, true,
+                            &mut bookvalue_cumulative_wins, &mut bookvalue_cumulative_losses);
+                        if bookvalue_metrics.trades_taken > prev_trades { if let Some(v) = &mut validator { v.record_signal(); v.record_entry_taken(); } }
+                    } else if live_args.strategy == crate::bot::pipeline::BtStrategy::CandleClock {
+                        let prev_trades = clock_metrics.trades_taken;
+                        crate::bot::pipeline::process_candleclock_snapshot(
+                            &mut clock_engine, &dual_snapshot, epoch_seconds, watched.end_time.timestamp() - FIVE_MINUTES_SECONDS,
+                            watched.end_time.timestamp(), &mut shadow, &mut clock_metrics, 1.0, true,
+                            &mut clock_cumulative_wins, &mut clock_cumulative_losses);
+                        if clock_metrics.trades_taken > prev_trades { if let Some(v) = &mut validator { v.record_signal(); v.record_entry_taken(); } }
+                    } else {
+                        if let Some(step) = run_shadow_strategy_step(
+                            &dual_snapshot, &watched.label, &watched.slug,
+                            watched.end_time.timestamp() - FIVE_MINUTES_SECONDS, watched.end_time.timestamp(),
+                            epoch_seconds, 1.0, &mut candle_engine, &mut ind_1m, &mut ind_5s,
+                            &mut signal_engine, &mut state_1m, &mut state_5s, &mut shadow, &mut gatekeeper,
+                            event_loggers.as_ref()) {
+                            if step.signal_seen { if let Some(v) = &mut validator { v.record_signal(); } }
+                            if step.entry_blocked { if let Some(v) = &mut validator { v.record_entry_blocked(); } }
+                            if step.entry_taken { if let Some(v) = &mut validator { v.record_entry_taken(); } }
+                            if let Some(exit_trade) = step.exit_trade {
+                                if let Some(v) = &mut validator {
+                                    v.record_trade(watched.slug.clone(), exit_trade.side, exit_trade.entry_price, exit_trade.exit_price, exit_trade.pnl_pct, exit_trade.duration, exit_trade.pnl_usd, exit_trade.bankroll_after);
+                                }
+                            }
+                        }
+                    }
+
+                    // Position status
+                    if shadow.is_active() {
+                        let exit_price = match shadow.token_side {
+                            Some(TokenSide::Yes) => best_bid_price(&dual_snapshot.yes).unwrap_or(0.0),
+                            Some(TokenSide::No) => best_bid_price(&dual_snapshot.no).unwrap_or(0.0),
+                            _ => 0.0,
+                        };
+                        let unrealized = shadow.pnl(exit_price) * shadow.size;
+                        let total = shadow.realized_pnl + unrealized;
+                        if epoch_seconds % 30 == 0 {
+                            println!("[TICK] {:?} entry={:.4} current={:.4} | PnL: {:.4}% | Total: {:.4}%",
+                                shadow.token_side.unwrap(), shadow.entry_price, exit_price, unrealized * 100.0, total * 100.0);
+                        }
+                    }
+                }
             }
-            _ = ticker.tick() => {
+        }
+    } else {
+        // ─── Polling loop (1Hz ticker) ───
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\n[SHADOW] Final PnL: {:.4}%", shadow.realized_pnl * 100.0);
+                    if let Some(v) = &validator {
+                        v.print_summary();
+                    }
+                    println!("Received Ctrl+C, stopping bot watch.");
+                    break;
+                }
+                _ = ticker.tick() => {
                 if Utc::now() >= watched.end_time || watched.slug != current_slug {
                     if shadow.is_active() {
                         let price = match shadow.token_side {
@@ -449,6 +642,12 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
                     fv_kalman = Some(crate::bot::pricing::KalmanFilter::new(0.0));
                     fv_jump_calibrator = Some(crate::bot::pricing::JumpCalibrator::with_defaults());
                     fv_metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd);
+                    hawkes_engine = crate::bot::strategy::HawkesFlowEngine::new();
+                    hawkes_metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd);
+                    bookvalue_engine = crate::bot::strategy::BookValueEngine::new();
+                    bookvalue_metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd);
+                    clock_engine = crate::bot::strategy::CandleClockEngine::new();
+                    clock_metrics = crate::bot::pipeline::PipelineMetrics::new(shadow.bankroll_usd);
                     state_1m = IndicatorState::default();
                     state_5s = IndicatorState::default();
                     last_yes_bid = 0.0;
@@ -540,6 +739,69 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
                                 v.record_entry_taken();
                             }
                         }
+                    } else if live_args.strategy == crate::bot::pipeline::BtStrategy::HawkesFlow {
+                        let prev_trades = hawkes_metrics.trades_taken;
+                        crate::bot::pipeline::process_hawkesflow_snapshot(
+                            &mut hawkes_engine,
+                            &dual_snapshot,
+                            epoch_seconds,
+                            watched.end_time.timestamp() - FIVE_MINUTES_SECONDS,
+                            watched.end_time.timestamp(),
+                            &mut shadow,
+                            &mut hawkes_metrics,
+                            1.0,
+                            true,
+                            &mut hawkes_cumulative_wins,
+                            &mut hawkes_cumulative_losses,
+                        );
+                        if hawkes_metrics.trades_taken > prev_trades {
+                            if let Some(v) = &mut validator {
+                                v.record_signal();
+                                v.record_entry_taken();
+                            }
+                        }
+                    } else if live_args.strategy == crate::bot::pipeline::BtStrategy::BookValue {
+                        let prev_trades = bookvalue_metrics.trades_taken;
+                        crate::bot::pipeline::process_bookvalue_snapshot(
+                            &mut bookvalue_engine,
+                            &dual_snapshot,
+                            epoch_seconds,
+                            watched.end_time.timestamp() - FIVE_MINUTES_SECONDS,
+                            watched.end_time.timestamp(),
+                            &mut shadow,
+                            &mut bookvalue_metrics,
+                            1.0,
+                            true,
+                            &mut bookvalue_cumulative_wins,
+                            &mut bookvalue_cumulative_losses,
+                        );
+                        if bookvalue_metrics.trades_taken > prev_trades {
+                            if let Some(v) = &mut validator {
+                                v.record_signal();
+                                v.record_entry_taken();
+                            }
+                        }
+                    } else if live_args.strategy == crate::bot::pipeline::BtStrategy::CandleClock {
+                        let prev_trades = clock_metrics.trades_taken;
+                        crate::bot::pipeline::process_candleclock_snapshot(
+                            &mut clock_engine,
+                            &dual_snapshot,
+                            epoch_seconds,
+                            watched.end_time.timestamp() - FIVE_MINUTES_SECONDS,
+                            watched.end_time.timestamp(),
+                            &mut shadow,
+                            &mut clock_metrics,
+                            1.0,
+                            true,
+                            &mut clock_cumulative_wins,
+                            &mut clock_cumulative_losses,
+                        );
+                        if clock_metrics.trades_taken > prev_trades {
+                            if let Some(v) = &mut validator {
+                                v.record_signal();
+                                v.record_entry_taken();
+                            }
+                        }
                     } else {
                     if let Some(step) = run_shadow_strategy_step(
                         &dual_snapshot,
@@ -618,8 +880,10 @@ async fn watch_btc_market(max_markets: Option<usize>, live_args: LiveShadowArgs)
                     }
                 }
             }
-        }
-    }
+        } // end poll select
+    } // end poll loop
+    } // end else
+    } // end market_loop
 
     input_source.shutdown().await;
 

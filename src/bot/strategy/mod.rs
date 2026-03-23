@@ -2,13 +2,19 @@
 //!
 //! Unified strategy engine for Polymarket trading decisions.
 
+pub mod book_value;
+pub mod candle_clock;
+pub mod hawkes_flow;
 mod heuristic;
 mod risk;
 mod types;
 
 pub mod fair_value;
 
+pub use book_value::{BookValueConfig, BookValueEngine};
+pub use candle_clock::{CandleClockConfig, CandleClockEngine};
 pub use fair_value::{FairValueEngine, FairValueSignalConfig};
+pub use hawkes_flow::{HawkesFlowConfig, HawkesFlowEngine};
 pub use heuristic::HeuristicEngine;
 pub use risk::RiskGate;
 pub use types::*;

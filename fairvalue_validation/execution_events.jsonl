@@ -1,0 +1,14 @@
+{"type":"shadow_entry","ts":1773522114,"market_slug":"btc-updown-5m-1773522000","side":"YES","price":0.38,"size_usd":1.0,"bankroll_after":4.0}
+{"type":"shadow_exit","ts":1773522186,"market_slug":"btc-updown-5m-1773522000","side":"YES","price":0.09,"pnl_usd":-0.7631578947368421,"bankroll_after":4.2368421052631575}
+{"type":"shadow_entry","ts":1773522315,"market_slug":"btc-updown-5m-1773522300","side":"YES","price":0.41,"size_usd":1.0,"bankroll_after":3.2368421052631575}
+{"type":"shadow_exit","ts":1773522423,"market_slug":"btc-updown-5m-1773522300","side":"YES","price":0.08,"pnl_usd":-0.8048780487804877,"bankroll_after":3.43196405648267}
+{"type":"shadow_entry","ts":1773522439,"market_slug":"btc-updown-5m-1773522300","side":"YES","price":0.16,"size_usd":1.0,"bankroll_after":2.43196405648267}
+{"type":"shadow_exit","ts":1773522514,"market_slug":"btc-updown-5m-1773522300","side":"YES","price":0.09,"pnl_usd":-0.43750000000000006,"bankroll_after":2.99446405648267}
+{"type":"shadow_entry","ts":1773522531,"market_slug":"btc-updown-5m-1773522300","side":"YES","price":0.16,"size_usd":1.0,"bankroll_after":1.99446405648267}
+{"type":"shadow_exit","ts":1773522539,"market_slug":"btc-updown-5m-1773522300","side":"YES","price":0.04,"pnl_usd":-0.75,"bankroll_after":2.24446405648267}
+{"type":"shadow_entry","ts":1773522675,"market_slug":"btc-updown-5m-1773522600","side":"YES","price":0.42,"size_usd":1.0,"bankroll_after":1.24446405648267}
+{"type":"shadow_exit","ts":1773522743,"market_slug":"btc-updown-5m-1773522600","side":"YES","price":0.45,"pnl_usd":0.0714285714285715,"bankroll_after":2.315892627911241}
+{"type":"shadow_entry","ts":1773522781,"market_slug":"btc-updown-5m-1773522600","side":"YES","price":0.44,"size_usd":1.0,"bankroll_after":1.315892627911241}
+{"type":"shadow_exit","ts":1773522782,"market_slug":"btc-updown-5m-1773522600","side":"YES","price":0.48,"pnl_usd":0.09090909090909087,"bankroll_after":2.406801718820332}
+{"type":"shadow_entry","ts":1773522786,"market_slug":"btc-updown-5m-1773522600","side":"YES","price":0.45,"size_usd":1.0,"bankroll_after":1.406801718820332}
+{"type":"shadow_exit","ts":1773522800,"market_slug":"btc-updown-5m-1773522600","side":"YES","price":0.07,"pnl_usd":-0.8444444444444444,"bankroll_after":1.5623572743758873}

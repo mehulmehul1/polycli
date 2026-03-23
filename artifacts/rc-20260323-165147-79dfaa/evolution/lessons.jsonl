@@ -1,0 +1,1 @@
+{"stage_name": "problem_decompose", "stage_num": 2, "category": "pipeline", "severity": "error", "description": "Stage problem_decompose failed: All models failed. Last error: LLM call failed after 4 retries for model mimo-v2-pro-free", "timestamp": "2026-03-23T16:58:25+00:00", "run_id": "rc-20260323-165147-79dfaa"}

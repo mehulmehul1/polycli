@@ -5,7 +5,7 @@ use crate::bot::logging::{EngineEvent, EngineEventLoggers};
 use crate::bot::risk::{best_ask_price, best_bid_price, decimal_to_f64, midpoint_price, GatekeeperState};
 use crate::bot::shadow::{ShadowPosition, ShadowStepResult, TokenSide};
 use crate::bot::signal::{EntrySignal, SignalEngine};
-use crate::bot::strategy::{HawkesFlowConfig, HawkesFlowEngine, StrategyEngine, StrategyDecision, Direction, Observation};
+use crate::bot::strategy::{BookValueConfig, BookValueEngine, CandleClockConfig, CandleClockEngine, HawkesFlowConfig, HawkesFlowEngine, StrategyEngine, StrategyDecision, Direction, Observation};
 use crate::bot::strategy_runner::run_shadow_strategy_step;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc, Timelike};
@@ -251,6 +251,10 @@ pub enum BtStrategy {
     FairValue,
     /// Hawkes flow: order flow self/cross-excitation dynamics with VPIN toxicity gate
     HawkesFlow,
+    /// BookValue: OBI + VAMP + mean reversion fusion (research-driven)
+    BookValue,
+    /// CandleClock: time-of-day + candle boundary + power hour effect
+    CandleClock,
 }
 
 #[derive(Args, Clone)]
@@ -1392,7 +1396,7 @@ pub fn process_hawkesflow_snapshot(
     let book_sum = yes_ask + no_ask;
 
     let obs = Observation {
-        ts: epoch_seconds as i64,
+        ts: snapshot.ts_exchange as i64, // milliseconds for sub-second Hawkes resolution
         condition_id: String::new(),
         market_slug: String::new(),
         yes_bid,
@@ -1465,6 +1469,198 @@ pub fn process_hawkesflow_snapshot(
                 }
                 if verbose {
                     println!("[HAWKES EXIT] {:.4}% | ${:.4} | Bankroll: ${:.2}",
+                        pnl * 100.0, dollar_pnl, shadow.bankroll_usd);
+                }
+                shadow.reset(epoch_seconds);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Process a single snapshot through the BookValue strategy engine
+pub fn process_bookvalue_snapshot(
+    engine: &mut BookValueEngine,
+    snapshot: &DualSnapshot,
+    epoch_seconds: u64,
+    start_ts: i64,
+    end_ts: i64,
+    shadow: &mut ShadowPosition,
+    metrics: &mut PipelineMetrics,
+    size: f64,
+    verbose: bool,
+    cumulative_wins: &mut Vec<f64>,
+    cumulative_losses: &mut Vec<f64>,
+) {
+    let yes_bid = best_bid_price(&snapshot.yes).unwrap_or(0.0);
+    let yes_ask = best_ask_price(&snapshot.yes).unwrap_or(1.0);
+    let no_bid = best_bid_price(&snapshot.no).unwrap_or(0.0);
+    let no_ask = best_ask_price(&snapshot.no).unwrap_or(1.0);
+    let yes_mid = (yes_bid + yes_ask) / 2.0;
+    let no_mid = (no_bid + no_ask) / 2.0;
+    let time_remaining = (end_ts - epoch_seconds as i64).max(0);
+
+    let obs = Observation {
+        ts: epoch_seconds as i64,
+        condition_id: String::new(),
+        market_slug: String::new(),
+        yes_bid,
+        yes_ask,
+        no_bid,
+        no_ask,
+        yes_mid,
+        no_mid,
+        book_sum: yes_ask + no_ask,
+        time_remaining_s: time_remaining,
+        indicator_5s: IndicatorState {
+            bb_width: Some(yes_ask - yes_bid),
+            ..Default::default()
+        },
+        indicator_1m: IndicatorState::default(),
+        fair_value_prob: None,
+        qlib_score: None,
+    };
+
+    let decision = engine.decide(&obs);
+
+    match decision {
+        StrategyDecision::Enter { direction, reason } => {
+            if !shadow.is_active() {
+                let (side, entry_price, entry_signal) = match direction {
+                    Direction::Yes => (crate::bot::shadow::TokenSide::Yes, yes_ask, crate::bot::signal::EntrySignal::Long),
+                    Direction::No => (crate::bot::shadow::TokenSide::No, no_ask, crate::bot::signal::EntrySignal::Short),
+                };
+                shadow.token_side = Some(side);
+                shadow.active_entry = Some(entry_signal);
+                shadow.entry_price = entry_price;
+                shadow.size = 1.0;
+                shadow.position_size_usd = size;
+                shadow.bankroll_usd -= size;
+                shadow.entry_timestamp = epoch_seconds;
+                metrics.trades_taken += 1;
+                if verbose {
+                    println!("[BOOKVALUE] ENTER {:?} | mid={:.4}", direction, yes_mid);
+                    println!("[BOOKVALUE ENTRY] {:?} @ {:.4} | {} | Bankroll: ${:.2}",
+                        direction, entry_price, reason.detail, shadow.bankroll_usd);
+                }
+            }
+        }
+        StrategyDecision::Exit { reason, .. } => {
+            if shadow.is_active() {
+                let exit_price = match shadow.token_side {
+                    Some(crate::bot::shadow::TokenSide::Yes) => best_bid_price(&snapshot.yes).unwrap_or(0.0),
+                    Some(crate::bot::shadow::TokenSide::No) => best_bid_price(&snapshot.no).unwrap_or(0.0),
+                    _ => 0.0,
+                };
+                let pnl = shadow.pnl(exit_price);
+                let dollar_pnl = pnl * shadow.position_size_usd;
+                shadow.bankroll_usd += shadow.position_size_usd + dollar_pnl;
+                metrics.trades_taken += 1;
+                if dollar_pnl >= 0.0 {
+                    metrics.wins += 1;
+                    cumulative_wins.push(dollar_pnl);
+                } else {
+                    metrics.losses += 1;
+                    cumulative_losses.push(dollar_pnl);
+                }
+                if verbose {
+                    println!("[BOOKVALUE EXIT] {:.4}% | ${:.4} | Bankroll: ${:.2}",
+                        pnl * 100.0, dollar_pnl, shadow.bankroll_usd);
+                }
+                shadow.reset(epoch_seconds);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Process a single snapshot through the CandleClock strategy engine
+pub fn process_candleclock_snapshot(
+    engine: &mut CandleClockEngine,
+    snapshot: &DualSnapshot,
+    epoch_seconds: u64,
+    start_ts: i64,
+    end_ts: i64,
+    shadow: &mut ShadowPosition,
+    metrics: &mut PipelineMetrics,
+    size: f64,
+    verbose: bool,
+    cumulative_wins: &mut Vec<f64>,
+    cumulative_losses: &mut Vec<f64>,
+) {
+    let yes_bid = best_bid_price(&snapshot.yes).unwrap_or(0.0);
+    let yes_ask = best_ask_price(&snapshot.yes).unwrap_or(1.0);
+    let no_bid = best_bid_price(&snapshot.no).unwrap_or(0.0);
+    let no_ask = best_ask_price(&snapshot.no).unwrap_or(1.0);
+    let yes_mid = (yes_bid + yes_ask) / 2.0;
+    let no_mid = (no_bid + no_ask) / 2.0;
+    let time_remaining = (end_ts - epoch_seconds as i64).max(0);
+
+    let obs = Observation {
+        ts: epoch_seconds as i64,
+        condition_id: String::new(),
+        market_slug: String::new(),
+        yes_bid,
+        yes_ask,
+        no_bid,
+        no_ask,
+        yes_mid,
+        no_mid,
+        book_sum: yes_ask + no_ask,
+        time_remaining_s: time_remaining,
+        indicator_5s: IndicatorState {
+            bb_width: Some(yes_ask - yes_bid),
+            ..Default::default()
+        },
+        indicator_1m: IndicatorState::default(),
+        fair_value_prob: None,
+        qlib_score: None,
+    };
+
+    let decision = engine.decide(&obs);
+
+    match decision {
+        StrategyDecision::Enter { direction, reason } => {
+            if !shadow.is_active() {
+                let (side, entry_price, entry_signal) = match direction {
+                    Direction::Yes => (crate::bot::shadow::TokenSide::Yes, yes_ask, crate::bot::signal::EntrySignal::Long),
+                    Direction::No => (crate::bot::shadow::TokenSide::No, no_ask, crate::bot::signal::EntrySignal::Short),
+                };
+                shadow.token_side = Some(side);
+                shadow.active_entry = Some(entry_signal);
+                shadow.entry_price = entry_price;
+                shadow.size = 1.0;
+                shadow.position_size_usd = size;
+                shadow.bankroll_usd -= size;
+                shadow.entry_timestamp = epoch_seconds;
+                metrics.trades_taken += 1;
+                if verbose {
+                    println!("[CLOCK] ENTER {:?} | mid={:.4}", direction, yes_mid);
+                    println!("[CLOCK ENTRY] {:?} @ {:.4} | {} | Bankroll: ${:.2}",
+                        direction, entry_price, reason.detail, shadow.bankroll_usd);
+                }
+            }
+        }
+        StrategyDecision::Exit { reason, .. } => {
+            if shadow.is_active() {
+                let exit_price = match shadow.token_side {
+                    Some(crate::bot::shadow::TokenSide::Yes) => best_bid_price(&snapshot.yes).unwrap_or(0.0),
+                    Some(crate::bot::shadow::TokenSide::No) => best_bid_price(&snapshot.no).unwrap_or(0.0),
+                    _ => 0.0,
+                };
+                let pnl = shadow.pnl(exit_price);
+                let dollar_pnl = pnl * shadow.position_size_usd;
+                shadow.bankroll_usd += shadow.position_size_usd + dollar_pnl;
+                metrics.trades_taken += 1;
+                if dollar_pnl >= 0.0 {
+                    metrics.wins += 1;
+                    cumulative_wins.push(dollar_pnl);
+                } else {
+                    metrics.losses += 1;
+                    cumulative_losses.push(dollar_pnl);
+                }
+                if verbose {
+                    println!("[CLOCK EXIT] {:.4}% | ${:.4} | Bankroll: ${:.2}",
                         pnl * 100.0, dollar_pnl, shadow.bankroll_usd);
                 }
                 shadow.reset(epoch_seconds);
@@ -1713,6 +1909,8 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
         BtStrategy::LateWindow => (0.85, 0.98),
         BtStrategy::FairValue => (0.05, 0.95), // wide band, model filters instead
         BtStrategy::HawkesFlow => (0.05, 0.95), // wide band, flow model filters instead
+        BtStrategy::BookValue => (0.05, 0.95), // wide band, signal model filters instead
+        BtStrategy::CandleClock => (0.05, 0.95), // wide band, time model filters instead
     };
 
     // Setup DuckDB
@@ -1796,6 +1994,8 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
                     CalibratedFairValue::with_defaults(base_model)
                 };
                 let mut hawkesflow_engine = HawkesFlowEngine::with_config(HawkesFlowConfig::default());
+                let mut bookvalue_engine = BookValueEngine::with_config(BookValueConfig::default());
+                let mut clock_engine = CandleClockEngine::with_config(CandleClockConfig::default());
 
                 let snapshots = build_replay_snapshots(&replay_rows, ReplayMode::EventByEvent);
                 let mut replay_source = ReplaySnapshotSource::new(snapshots);
@@ -1831,6 +2031,34 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
                     } else if args.strategy == BtStrategy::HawkesFlow {
                         process_hawkesflow_snapshot(
                             &mut hawkesflow_engine,
+                            &snapshot,
+                            epoch_seconds,
+                            discovered.start_ts,
+                            discovered.end_ts,
+                            &mut shadow,
+                            &mut metrics,
+                            args.size,
+                            args.verbose,
+                            &mut cumulative_wins,
+                            &mut cumulative_losses,
+                        );
+                    } else if args.strategy == BtStrategy::BookValue {
+                        process_bookvalue_snapshot(
+                            &mut bookvalue_engine,
+                            &snapshot,
+                            epoch_seconds,
+                            discovered.start_ts,
+                            discovered.end_ts,
+                            &mut shadow,
+                            &mut metrics,
+                            args.size,
+                            args.verbose,
+                            &mut cumulative_wins,
+                            &mut cumulative_losses,
+                        );
+                    } else if args.strategy == BtStrategy::CandleClock {
+                        process_candleclock_snapshot(
+                            &mut clock_engine,
                             &snapshot,
                             epoch_seconds,
                             discovered.start_ts,
@@ -1922,6 +2150,8 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
                 CalibratedFairValue::with_defaults(base_model)
             };
             let mut hawkesflow_engine = HawkesFlowEngine::with_config(HawkesFlowConfig::default());
+            let mut bookvalue_engine = BookValueEngine::with_config(BookValueConfig::default());
+            let mut clock_engine = CandleClockEngine::with_config(CandleClockConfig::default());
 
             // Query ticks for this market
             let tick_sql = format!(
@@ -2000,6 +2230,34 @@ pub async fn run_backtest_pmxt(args: BacktestPmxtArgs) -> Result<()> {
                 } else if args.strategy == BtStrategy::HawkesFlow {
                     process_hawkesflow_snapshot(
                         &mut hawkesflow_engine,
+                        &snapshot,
+                        epoch_seconds,
+                        market.start_ts,
+                        market.end_ts,
+                        &mut shadow,
+                        &mut metrics,
+                        args.size,
+                        args.verbose,
+                        &mut cumulative_wins,
+                        &mut cumulative_losses,
+                    );
+                } else if args.strategy == BtStrategy::BookValue {
+                    process_bookvalue_snapshot(
+                        &mut bookvalue_engine,
+                        &snapshot,
+                        epoch_seconds,
+                        market.start_ts,
+                        market.end_ts,
+                        &mut shadow,
+                        &mut metrics,
+                        args.size,
+                        args.verbose,
+                        &mut cumulative_wins,
+                        &mut cumulative_losses,
+                    );
+                } else if args.strategy == BtStrategy::CandleClock {
+                    process_candleclock_snapshot(
+                        &mut clock_engine,
                         &snapshot,
                         epoch_seconds,
                         market.start_ts,
