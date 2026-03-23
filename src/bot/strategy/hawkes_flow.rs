@@ -367,8 +367,8 @@ impl HawkesFlowEngine {
         }
 
         // HEAI momentum confirmation: recent HEAI should be consistently directional
-        if self.heai_history.len() >= 5 {
-            let recent: Vec<f64> = self.heai_history.iter().rev().take(5).cloned().collect();
+        if self.heai_history.len() >= 3 {
+            let recent: Vec<f64> = self.heai_history.iter().rev().take(3).cloned().collect();
             let all_same_sign = recent.iter().all(|&h| h * heai > 0.0);
             if !all_same_sign {
                 return None;
