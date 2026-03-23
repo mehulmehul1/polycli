@@ -1,0 +1,65 @@
+project:
+  name: "polycli-strategy-discovery"
+  mode: "full-auto"
+
+research:
+  topic: >
+    Discover profitable trading strategies for Polymarket BTC Up/Down 5-minute 
+    binary prediction markets. Existing strategies include Scalper (EMA crossover + RSI + 
+    Bollinger Bands), LateWindow (high-prob sniping), and FairValue (logit jump-diffusion model).
+    Propose new strategies by combining indicators differently, adding new signals 
+    (volume, order book depth, cross-asset correlation), or creating hybrid approaches.
+    Test all strategies using backtest-pmxt on recorded live orderbook data.
+  domains:
+    - "quantitative-finance"
+    - "prediction-markets"
+    - "algorithmic-trading"
+
+runtime:
+  timezone: "UTC"
+  max_parallel_tasks: 2
+  retry_limit: 3
+
+llm:
+  provider: "acp"
+  acp:
+    agent: "opencode"
+    cwd: "C:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/polycli"
+    acpx_command: "acpx"
+
+experiment:
+  mode: "sandbox"
+  time_budget_sec: 600
+  max_iterations: 20
+  metric_key: "fitness_score"
+  metric_direction: "maximize"
+  sandbox:
+    python_path: "C:/Python312/python.exe"
+    gpu_required: false
+    max_memory_mb: 2048
+
+security:
+  hitl_required_stages: []
+  allow_publish_without_approval: true
+  redact_sensitive_logs: false
+
+notifications:
+  channel: "console"
+
+knowledge_base:
+  backend: "markdown"
+  root: "C:/Users/mehul/OneDrive/Desktop/Studio/PROJECTS/polycli/AutoResearchClaw/kb"
+
+openclaw_bridge:
+  use_cron: false
+  use_message: false
+  use_memory: false
+  use_sessions_spawn: true
+  use_web_fetch: true
+  use_browser: false
+
+metaclaw_bridge:
+  enabled: false
+
+prompts:
+  custom_file: ""
