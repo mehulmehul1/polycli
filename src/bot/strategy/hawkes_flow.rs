@@ -434,7 +434,7 @@ impl HawkesFlowEngine {
                 });
             }
             // Stop loss
-            if move_in_favor < -0.08 {
+            if move_in_favor < -0.06 {
                 return Some(ExitReason::StopLoss {
                     pnl_pct: move_in_favor * 100.0,
                 });
