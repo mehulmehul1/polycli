@@ -58,7 +58,7 @@ impl Default for HawkesFlowConfig {
             vpin_window: 50,        // 50 price updates for VPIN
             min_time_remaining: 45, // 45 seconds minimum
             max_entry_prob: 0.88,
-            min_entry_prob: 0.15,
+            min_entry_prob: 0.18,
             min_bb_width: 0.0,        // spread proxy — don't gate on this
             cooldown_observations: 3, // 3 observations after exit
             base_tp_pct: 0.30,        // 30% take profit — prediction market winners go to $1
