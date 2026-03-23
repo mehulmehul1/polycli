@@ -428,7 +428,7 @@ impl HawkesFlowEngine {
                 Direction::Yes => p - entry_price,
                 Direction::No => entry_price - p,
             };
-            if move_in_favor > 0.10 {
+            if move_in_favor > 0.12 {
                 return Some(ExitReason::TakeProfit {
                     pnl_pct: move_in_favor * 100.0,
                 });
